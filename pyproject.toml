@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbdragoness"
+version = "0.1.0"
+description = "A lightweight DB GUI module for SQL/NoSQL, like phpMyAdmin but Pythonic!"
+authors = [{name = "Tulika Thampi (also known as dragoness)"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    # Core framework
+    "flask>=2.3.0,<3.0.0",
+    "click>=8.1.0,<9.0.0",
+    
+    # SQL databases
+    "sqlalchemy>=2.0.0,<3.0.0",
+    "pymysql>=1.1.0,<2.0.0",
+    "psycopg2-binary>=2.9.0,<3.0.0",
+    "duckdb-engine>=0.9.0,<1.0.0",
+    
+    # NoSQL databases
+    "tinydb>=4.8.0,<5.0.0",
+    "pymongo>=4.6.0,<5.0.0",
+    
+    # Security and utilities
+    "keyring>=24.0.0,<25.0.0",
+    "cryptography>=41.0.0,<42.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+]
+
+[project.scripts]
+dbdragoness = "dbdragoness.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tech-dragoness/dbdragoness"
+
+[tool.setuptools]
+packages = ["dbdragoness"]
+
+[tool.setuptools.package-data]
+dbdragoness = [
+    "templates/**/*",
+    "static/**/*",
+    "frontend/**/*",
+    "sql_handlers/**/*",
+    "nosql_handlers/**/*",
+]
