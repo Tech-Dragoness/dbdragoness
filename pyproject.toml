@@ -4,12 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbdragoness"
-version = "0.1.0"
+version = "0.1.1"
 description = "A lightweight DB GUI module for SQL/NoSQL, like phpMyAdmin but Pythonic!"
-authors = [{name = "Tulika Thampi (also known as dragoness)"}]
-license = {text = "MIT"}
+authors = [{name = "Tulika Thampi (Dragoness)"}]
+license = "MIT"
 readme = "README.md"
 requires-python = ">=3.8"
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+]
+
 dependencies = [
     # Core framework
     "flask>=2.3.0,<3.0.0",
@@ -38,30 +48,17 @@ dev = [
     "flake8>=6.0.0",
 ]
 
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-]
-
 [project.scripts]
 dbdragoness = "dbdragoness.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/tech-dragoness/dbdragoness"
 
-[tool.setuptools]
-packages = ["dbdragoness"]
+[tool.setuptools.packages.find]
+where = ["."]
 
 [tool.setuptools.package-data]
 dbdragoness = [
-    "templates/**/*",
+    "data/**/*",
     "static/**/*",
-    "frontend/**/*",
-    "sql_handlers/**/*",
-    "nosql_handlers/**/*",
 ]

@@ -33,11 +33,6 @@ dbdragoness --type sql --db mydb
 ## License
 
 MIT License
-```
-
-**Create `LICENSE`** (MIT License example):
-```
-MIT License
 
 Copyright (c) 2025 [Tulika Thampi]
 

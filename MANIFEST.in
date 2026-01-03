@@ -1,0 +1,5 @@
+prune dbdragoness/frontend
+prune venv
+prune test_env
+prune .git
+global-exclude __pycache__ *.pyc

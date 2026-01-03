@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+frontend/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -26,6 +27,7 @@ MANIFEST
 
 # Virtual Environment
 venv/
+test_env/
 ENV/
 env/
 
@@ -39,10 +41,7 @@ env/
 
 # Frontend
 node_modules/
-dbdragoness/frontend/node_modules/
-dbdragoness/frontend/build/
-dbdragoness/frontend/dist/
-dbdragoness/static/react/
+dbdragoness/frontend/
 
 # OS
 .DS_Store
