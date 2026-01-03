@@ -34,7 +34,7 @@ dbdragoness --type sql --db mydb
 
 MIT License
 
-Copyright (c) 2025 [Tulika Thampi]
+Copyright (c) 2026 Tulika Thampi. All rights reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -42,6 +42,8 @@ in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
+
+Credit Requirement: The original author, Tulika Thampi, and the original work must be credited in all copies, distributions, or derivative works. This credit should be visible in documentation, UI, or other appropriate places where the Software is used or presented.
 
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
