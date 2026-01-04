@@ -18,10 +18,53 @@
 - ⚡ Fast and lightweight
 
 ## Installation
+
+### Best and easiest method
+
 ```bash
 pip install --upgrade dbdragoness
 ```
 Note: Latest version is 0.1.3
+
+### Development Setup (For Developers & Academic Use)
+
+This option is recommended if you want to explore, modify, or study the source code.
+
+1. Clone the Repository
+```bash
+git clone https://github.com/tech-dragoness/dbdragoness.git
+cd dbdragoness
+```
+
+2. Create and Activate a Virtual Environment (Recommended)
+```bash
+python -m venv venv
+```
+
+Windows
+```bash
+venv\Scripts\activate
+```
+
+macOS / Linux
+```bash
+source venv/bin/activate
+```
+
+3. Install the Project in Editable Mode
+
+Editable mode ensures that any changes you make to the source code are immediately reflected when running the tool.
+```bash
+pip install -e .
+```
+
+4. Run DBDragoness
+dbdragoness
+
+5. (Optional) Verify Installation
+```bash
+dbdragoness --help
+``
 
 ## Quick Start
 ```bash
