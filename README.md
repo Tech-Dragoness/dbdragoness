@@ -59,12 +59,14 @@ pip install -e .
 ```
 
 4. Run DBDragoness
+```bash
 dbdragoness
+```
 
 5. (Optional) Verify Installation
 ```bash
 dbdragoness --help
-``
+```
 
 ## Quick Start
 ```bash
