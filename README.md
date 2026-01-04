@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="160" alt="DBDragoness Logo">
+  <img src="assets/Logo.png" width="160" alt="DBDragoness Logo">
 </p>
 
 <h1 align="center">DBDragoness 🐉</h1>
