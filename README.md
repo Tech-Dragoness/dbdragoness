@@ -13,8 +13,9 @@ A lightweight, cross-platform database GUI manager for SQL and NoSQL databases.
 
 ## Installation
 ```bash
-pip install dbdragoness
+pip install --upgrade dbdragoness
 ```
+Note: Latest version is 0.1.3
 
 ## Quick Start
 ```bash
