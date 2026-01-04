@@ -1,6 +1,12 @@
-# DBDragoness 🐉
+<p align="center">
+  <img src="assets/logo.png" width="160" alt="DBDragoness Logo">
+</p>
 
-A lightweight, cross-platform database GUI manager for SQL and NoSQL databases.
+<h1 align="center">DBDragoness 🐉</h1>
+
+<p align="center">
+  A lightweight GUI manager for SQL & NoSQL databases
+</p>
 
 ## Features
 
