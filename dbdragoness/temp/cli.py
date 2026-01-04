@@ -4,6 +4,7 @@ import webbrowser
 import threading
 import subprocess
 import os
+import platform
 import click
 from .app import create_app
 from .db_registry import DBRegistry
@@ -18,6 +19,24 @@ def find_available_port(start_port=8000):
             if input().lower() != 'y':
                 sys.exit("Okay, exiting—no port for us today!")
             port += 1
+            
+def ensure_react_built():
+    """Ensure React frontend is built on first run after pip install"""
+    frontend_dir = os.path.join(os.path.dirname(__file__), 'frontend')
+    react_build_dir = os.path.join(os.path.dirname(__file__), 'static', 'react')
+    
+    # Check if React build exists
+    if os.path.exists(os.path.join(react_build_dir)):
+        return True
+    
+    # If frontend source exists, try to build
+    if os.path.exists(frontend_dir):
+        print("📦 React frontend not built. Building now...")
+        return build_react_frontend()
+    
+    # No React available
+    print("⚠️ React frontend not available!!!")
+    return False
 
 def build_react_frontend():
     """Build React frontend before starting Flask"""
@@ -32,13 +51,29 @@ def build_react_frontend():
     
     # Try to find npm in common locations
     npm_cmd = 'npm'
-    possible_npm_paths = [
-        'npm',  # System PATH
-        'npm.cmd',  # Windows
-        r'C:\Program Files\nodejs\npm.cmd',
-        r'C:\Program Files (x86)\nodejs\npm.cmd',
-        os.path.expanduser('~\\AppData\\Roaming\\npm\\npm.cmd'),
-    ]
+
+    possible_npm_paths = ['npm']  # Start with PATH
+
+    # Add platform-specific paths
+    if platform.system() == 'Windows':
+        possible_npm_paths.extend([
+            'npm.cmd',
+            r'C:\Program Files\nodejs\npm.cmd',
+            r'C:\Program Files (x86)\nodejs\npm.cmd',
+            os.path.expanduser('~\\AppData\\Roaming\\npm\\npm.cmd'),
+        ])
+    elif platform.system() == 'Darwin':  # macOS
+        possible_npm_paths.extend([
+            '/usr/local/bin/npm',
+            '/opt/homebrew/bin/npm',
+            os.path.expanduser('~/.nvm/versions/node/*/bin/npm'),
+        ])
+    else:  # Linux and others
+        possible_npm_paths.extend([
+            '/usr/bin/npm',
+            '/usr/local/bin/npm',
+            os.path.expanduser('~/.nvm/versions/node/*/bin/npm'),
+        ])
     
     # Find working npm command
     for npm_path in possible_npm_paths:
@@ -60,19 +95,20 @@ def build_react_frontend():
         # Check if node_modules exists, if not run npm install
         if not os.path.exists(os.path.join(frontend_dir, 'node_modules')):
             print("📦 Installing npm dependencies...")
-            subprocess.run([npm_cmd, 'install'], cwd=frontend_dir, check=True, shell=True)
-        
+            # Use shell=True only on Windows for .cmd files
+            use_shell = platform.system() == 'Windows' and npm_cmd.endswith('.cmd')
+
+            subprocess.run([npm_cmd, 'install'], cwd=frontend_dir, check=True, shell=use_shell)
+
         # Build React app
-        subprocess.run([npm_cmd, 'run', 'build'], cwd=frontend_dir, check=True, shell=True)
+        subprocess.run([npm_cmd, 'run', 'build'], cwd=frontend_dir, check=True, shell=use_shell)
         print("✅ React frontend built successfully!")
         return True
     except subprocess.CalledProcessError as e:
         print(f"❌ React build failed: {e}")
-        print("⚠️  Continuing with HTML templates only...")
         return False
     except FileNotFoundError:
         print("❌ npm not found. Please install Node.js and add it to PATH")
-        print("⚠️  Continuing with HTML templates only...")
         print("\nTo add Node.js to PATH:")
         print("1. Find Node.js installation (usually C:\\Program Files\\nodejs)")
         print("2. Add to System Environment Variables > Path")
@@ -87,16 +123,13 @@ def build_react_frontend():
 @click.option('--db', 'db_name', help='Database name to open or create')
 @click.option('--table', 'table_name', help='Table/collection name to open or create')
 @click.option('--port', default=8000, help='Port to run on (default: 8000)')
-@click.option('--no-react-build', is_flag=True, help='Skip React build (use existing build)')
-@click.option('--use-react', is_flag=True, help='Open React UI instead of HTML')
 def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, use_react):
     """DBDragoness - Database GUI Manager
     
     Examples:
-        dbdragoness                          # Interactive mode (HTML UI)
-        dbdragoness --use-react              # Use React UI
-        dbdragoness --type sql               # Open SQL homepage
-        dbdragoness --no-react-build         # Skip React build, faster startup
+        dbdragoness                                    # Interactive mode
+        dbdragoness --type sql                         # Open SQL homepage
+        dbdragoness --type sql --handler MySQL         # Opens directly into MySQL homepage
     """
     
     # If subcommand invoked, don't run main logic
@@ -106,11 +139,11 @@ def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, u
     # Build React frontend unless skipped
     react_available = False
     if not no_react_build:
-        react_available = build_react_frontend()
+        react_available = ensure_react_built()  # ✅ Use new function
     else:
         # Check if React build exists at dbdragoness/static/react
         react_build_dir = os.path.join(os.path.dirname(__file__), 'static', 'react')
-        react_available = os.path.exists(os.path.join(react_build_dir, 'index.html'))
+        react_available = os.path.exists(os.path.join(react_build_dir))
         if react_available:
             print("✓ Using existing React build")
     
@@ -156,9 +189,6 @@ def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, u
     if react_available:
         target_url = f"http://localhost:{port}/react/"
         click.echo("🚀 Using React UI (default)")
-    else:
-        target_url = f"http://localhost:{port}/dbdragoness"
-        click.echo("⚠️  React not available, using HTML UI")
     
     # Handle database and table operations (keeping existing logic)
     if db_name:
@@ -178,26 +208,18 @@ def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, u
                         if db_type == 'sql':
                             if use_react and react_available:
                                 target_url = f"http://localhost:{port}/react/#/db/{db_name}/table/{table_name}"
-                            else:
-                                target_url = f"http://localhost:{port}/dbdragoness/db/{db_name}/table/{table_name}"
                         else:
                             if use_react and react_available:
                                 target_url = f"http://localhost:{port}/react/#/db/{db_name}/collection/{table_name}"
-                            else:
-                                target_url = f"http://localhost:{port}/dbdragoness/db/{db_name}/collection/{table_name}"
                     else:
                         click.echo(f"Creating table '{table_name}' in database '{db_name}'...")
                         create_table_or_collection(handler, db_name, table_name, db_type)
                         if db_type == 'sql':
                             if use_react and react_available:
                                 target_url = f"http://localhost:{port}/react/#/db/{db_name}/table/{table_name}"
-                            else:
-                                target_url = f"http://localhost:{port}/dbdragoness/db/{db_name}/table/{table_name}"
                         else:
                             if use_react and react_available:
                                 target_url = f"http://localhost:{port}/react/#/db/{db_name}/collection/{table_name}"
-                            else:
-                                target_url = f"http://localhost:{port}/dbdragoness/db/{db_name}/collection/{table_name}"
                 
                 except Exception as e:
                     click.echo(f"Error accessing database: {e}", err=True)
@@ -205,8 +227,6 @@ def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, u
             else:
                 if use_react and react_available:
                     target_url = f"http://localhost:{port}/react/#/db/{db_name}"
-                else:
-                    target_url = f"http://localhost:{port}/dbdragoness/db/{db_name}"
         else:
             if click.confirm(f"Database '{db_name}' does not exist. Create it?", default=True):
                 click.echo(f"Creating database '{db_name}'...")
@@ -220,18 +240,12 @@ def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, u
                         if db_type == 'sql':
                             if use_react and react_available:
                                 target_url = f"http://localhost:{port}/react/#/db/{db_name}/table/{table_name}"
-                            else:
-                                target_url = f"http://localhost:{port}/dbdragoness/db/{db_name}/table/{table_name}"
                         else:
                             if use_react and react_available:
                                 target_url = f"http://localhost:{port}/react/#/db/{db_name}/collection/{table_name}"
-                            else:
-                                target_url = f"http://localhost:{port}/dbdragoness/db/{db_name}/collection/{table_name}"
                     else:
                         if use_react and react_available:
                             target_url = f"http://localhost:{port}/react/#/db/{db_name}"
-                        else:
-                            target_url = f"http://localhost:{port}/dbdragoness/db/{db_name}"
                 
                 except Exception as e:
                     click.echo(f"Error creating database: {e}", err=True)
@@ -240,8 +254,6 @@ def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, u
                 if click.confirm("Open homepage instead?", default=True):
                     if use_react and react_available:
                         target_url = f"http://localhost:{port}/react/"
-                    else:
-                        target_url = f"http://localhost:{port}/dbdragoness"
                 else:
                     click.echo("Exiting...")
                     sys.exit(0)

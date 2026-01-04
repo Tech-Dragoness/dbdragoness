@@ -10,7 +10,11 @@
     "CREATE TABLE customers (\n    customer_id INT PRIMARY KEY,\n    name TEXT\n);\nCREATE TABLE orders (\n    order_id INT PRIMARY KEY,\n    customer_id INT,\n    order_date DATE,\n    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)\n);\nCREATE TABLE products (\n    product_id INT PRIMARY KEY,\n    product_name TEXT,\n    price DECIMAL(10,2)\n);\nCREATE TABLE order_items (\n    order_id INT,\n    product_id INT,\n    quantity INT,\n    PRIMARY KEY (order_id, product_id),\n    FOREIGN KEY (order_id) REFERENCES orders(order_id),\n    FOREIGN KEY (product_id) REFERENCES products(product_id)\n);\nINSERT INTO customers VALUES\n(1, 'Alice'),\n(2, 'Bob');\n\nINSERT INTO products VALUES\n(1, 'Pen', 10.00),\n(2, 'Book', 50.00);\n\nINSERT INTO orders VALUES\n(101, 1, '2024-01-10'),\n(102, 2, '2024-01-12');\n\nINSERT INTO order_items VALUES\n(101, 1, 2),\n(101, 2, 1),\n(102, 2, 3);",
     "SELECT * FROM order_totals;",
     "SELECT * FROM order_details;",
-    "select * from order_items;"
+    "select * from order_items;",
+    "create database trial1;",
+    "insert into table1 values (66, 12)",
+    "insert into table1 values(66, 'Tulika')",
+    "INSERT INTO trial1 (name) VALUES ('name');"
   ],
   "MySQL": [
     "SHOW CREATE TABLE table2",

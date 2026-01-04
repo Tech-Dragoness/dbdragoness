@@ -736,18 +736,12 @@ else:
                         for old_col_name in old_autoincrement_cols:
                             old_seq_name = f"{old_table_name}_{old_col_name}_seq"
                             quoted_old_seq = self._quote_identifier(old_seq_name)
-                            
-                            # Use CASCADE to force-drop sequence and its dependencies
-                            temp_engine = create_engine(f"duckdb:///{self._get_db_path(self.current_db)}")
                             try:
-                                with temp_engine.connect() as temp_conn:
-                                    temp_conn.execute(text(f"DROP SEQUENCE IF EXISTS {quoted_old_seq} CASCADE"))
-                                    temp_conn.commit()
-                                    self.logger.debug(f"Dropped old sequence {old_seq_name} CASCADE")
+                                conn.execute(text(f"DROP SEQUENCE IF EXISTS {quoted_old_seq} CASCADE"))
+                                self.logger.debug(f"Dropped old sequence {old_seq_name} CASCADE")
                             except Exception as drop_err:
                                 self.logger.warning(f"Could not drop old sequence {old_seq_name}: {drop_err}")
-                            finally:
-                                temp_engine.dispose()
+
                 except Exception as cleanup_err:
                     self.logger.warning(f"Sequence cleanup failed: {cleanup_err}")
 
@@ -766,18 +760,12 @@ else:
                             quoted_seq = self._quote_identifier(seq_name)
                             
                             # Create sequence in separate connection
-                            temp_engine = create_engine(f"duckdb:///{self._get_db_path(self.current_db)}")
                             try:
-                                with temp_engine.connect() as temp_conn:
-                                    # Don't try to drop - we already cleaned up old ones
-                                    temp_conn.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {quoted_seq} START 1"))
-                                    temp_conn.commit()
-                                    self.logger.debug(f"Created sequence {seq_name}")
+                                conn.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {quoted_seq} START 1"))
+                                self.logger.debug(f"Created sequence {seq_name}")
                             except Exception as e:
                                 self.logger.error(f"Failed to create sequence {seq_name}: {e}")
                                 raise
-                            finally:
-                                temp_engine.dispose()
             
                 # ✅ STEP 2: Build column definitions - preserve CHECK constraints
                 for col_def in new_columns:
@@ -866,10 +854,7 @@ else:
                 quoted_temp = self._quote_identifier(temp_table_name)
 
                 self.logger.debug(f"Creating temp table with SQL: CREATE TABLE {quoted_temp} ({col_def})")
-                # FIX: Don't nest transactions - commit previous work first
-                conn.commit()
                 conn.execute(text(f"CREATE TABLE {quoted_temp} ({col_def})"))
-                conn.commit()
             
                 # Build column mapping
                 column_mapping = {}
@@ -937,7 +922,21 @@ else:
                     select_cols = ', '.join(select_parts)
                     insert_cols_str = ', '.join(insert_cols)
                     # ✅ CRITICAL FIX: Use fully qualified name for source table
-                    conn.execute(text(f"INSERT INTO {quoted_temp} ({insert_cols_str}) SELECT {select_cols} FROM {old_table_qualified}"))
+                    # Resolve table dynamically for insert
+                    from sqlalchemy import inspect
+
+                    inspector = inspect(conn)
+                    all_tables = [t for t in inspector.get_table_names(schema=self.current_db)]
+                    if table_name_only in all_tables:
+                        source_table_ref = self._quote_identifier(table_name_only)
+                    else:
+                        # fallback to fully qualified
+                        source_table_ref = old_table_qualified
+
+                    conn.execute(
+                        text(f"INSERT INTO {quoted_temp} ({insert_cols_str}) SELECT {select_cols} FROM {source_table_ref}")
+                    )
+
             
                 # Drop old and rename - ✅ USE SIMPLE NAME FOR DROP (we're in same database)
                 quoted_new = self._quote_identifier(new_table_name)
