@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbdragoness"
-version = "0.1.3"
+version = "0.1.5"
 description = "A lightweight DB GUI module for SQL/NoSQL, like phpMyAdmin but Pythonic!"
 authors = [{name = "Tulika Thampi (Dragoness)"}]
 license = "MIT"

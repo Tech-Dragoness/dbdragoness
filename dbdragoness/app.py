@@ -18,7 +18,7 @@ from pathlib import Path
 def create_app(initial_db_type, handler_name=None):
     app = Flask(__name__)
     
-    app.config['SECRET_KEY'] = 'enchanted_key'
+    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'enchanted_key')
     app.config['DB_TYPE'] = initial_db_type
     
     # Setup logging
@@ -34,6 +34,14 @@ def create_app(initial_db_type, handler_name=None):
         for subdir in subdirs:
             dir_path = dir_path / subdir
         dir_path.mkdir(parents=True, exist_ok=True)
+        
+        # Set proper permissions on Linux/Unix
+        if platform.system() != 'Windows':
+            try:
+                os.chmod(dir_path, 0o755)
+            except Exception as e:
+                logger.debug(f"Could not set directory permissions: {e}")
+        
         return dir_path
     
     def format_procedure_result(result):
@@ -96,6 +104,16 @@ def create_app(initial_db_type, handler_name=None):
                 'type': 'status',
                 'rows_affected': 0
             }
+            
+    def send_sse_message(data_dict):
+        """Helper to send SSE messages properly (cross-platform)"""
+        return f"data: {json.dumps(data_dict)}\r\n\r\n"
+    
+    def normalize_db_name(name):
+        """Normalize database names for case-sensitive filesystems"""
+        if platform.system() != 'Windows':
+            return name.lower()
+        return name
             
     def format_nosql_result(result, handler):
         """Format NoSQL results - remove duplicate IDs"""
@@ -1243,11 +1261,11 @@ def create_app(initial_db_type, handler_name=None):
                 
                 # Validate inputs
                 if not all([source_db, target_db_name, target_type, target_handler]):
-                    yield f"data: {json.dumps({'error': 'Missing required parameters'})}\n\n"
+                    yield send_sse_message({'error': 'Missing required parameters'})
                     return
                 
                 if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', target_db_name):
-                    yield f"data: {json.dumps({'error': 'Target database name must start with a letter, contain only letters, numbers, underscores.'})}\n\n"
+                    yield send_sse_message({'error': 'Target database name must start with a letter, contain only letters, numbers, underscores.'})
                     return
                 
                 # Check if target name already exists in BOTH SQL and NoSQL
@@ -1256,7 +1274,7 @@ def create_app(initial_db_type, handler_name=None):
                 
                 # Check in current type
                 if target_db_name in current_handler.list_dbs():
-                    yield f"data: {json.dumps({'error': f'Database \"{target_db_name}\" already exists in current handler'})}\n\n"
+                    yield send_sse_message({'error': f'Database {target_db_name} already exists in current handler'})
                     return
                 
                 # Check in target type if different
@@ -1268,12 +1286,12 @@ def create_app(initial_db_type, handler_name=None):
                         temp_handler = NoSQLHandler(target_handler)
                     
                     if target_db_name in temp_handler.list_dbs():
-                        yield f"data: {json.dumps({'error': f'Database \"{target_db_name}\" already exists in target handler'})}\n\n"
+                        yield send_sse_message({'error': f'Database {target_db_name} already exists in target handler'})
                         return
                 
                 # Step 1: Export from source database (JSON format)
                 logger.info(f"Step 1: Exporting {source_db} as JSON")
-                yield f"data: {json.dumps({'progress': 5, 'stage': 'export', 'message': 'Starting export...'})}\n\n"
+                yield send_sse_message({'progress': 5, 'stage': 'export', 'message': 'Starting export...'})
                 
                 try:
                     current_handler.switch_db(source_db)
@@ -1293,13 +1311,13 @@ def create_app(initial_db_type, handler_name=None):
                     total_tables = len(tables)
                     
                     if total_tables == 0:
-                        yield f"data: {json.dumps({'error': 'Source database is empty'})}\n\n"
+                        yield send_sse_message({'error': 'Source database is empty'})
                         return
                     
                     for idx, table in enumerate(tables):
                         # Yield progress
                         progress = 5 + int((idx / total_tables) * 45)  # 5-50% for export
-                        yield f"data: {json.dumps({'progress': progress, 'stage': 'export', 'current': table, 'message': f'Exporting {table}...'})}\n\n"
+                        yield send_sse_message({'progress': progress, 'stage': 'export', 'current': table, 'message': f'Exporting {table}...'})
                         
                         table_data = {
                             'name': table,
@@ -1386,16 +1404,16 @@ def create_app(initial_db_type, handler_name=None):
                             export_data['procedures'].append(proc_data)
                     
                     logger.info(f"Export complete: {len(export_data['tables'])} tables")
-                    yield f"data: {json.dumps({'progress': 50, 'stage': 'export', 'message': 'Export complete'})}\n\n"
+                    yield send_sse_message({'progress': 50, 'stage': 'export', 'message': 'Export complete'})
                     
                 except Exception as export_error:
                     logger.error(f"Export failed: {export_error}")
-                    yield f"data: {json.dumps({'error': f'Export failed: {str(export_error)}'})}\n\n"
+                    yield send_sse_message({'error': f'Export failed: {str(export_error)}'})
                     return
                 
                 # Step 2: Switch to target handler
                 logger.info(f"Step 2: Switching to target handler ({target_type}/{target_handler})")
-                yield f"data: {json.dumps({'progress': 55, 'stage': 'switch', 'message': 'Switching database handler...'})}\n\n"
+                yield send_sse_message({'progress': 55, 'stage': 'switch', 'message': 'Switching database handler...'})
                 
                 try:
                     # Switch handler
@@ -1414,16 +1432,16 @@ def create_app(initial_db_type, handler_name=None):
                     target_handler_obj.switch_db(target_db_name)
                     
                     logger.info(f"Created target database: {target_db_name}")
-                    yield f"data: {json.dumps({'progress': 60, 'stage': 'switch', 'message': f'Created database {target_db_name}'})}\n\n"
+                    yield send_sse_message({'progress': 60, 'stage': 'switch', 'message': f'Created database {target_db_name}'})
                     
                 except Exception as switch_error:
                     logger.error(f"Handler switch failed: {switch_error}")
-                    yield f"data: {json.dumps({'error': f'Failed to switch handler: {str(switch_error)}'})}\n\n"
+                    yield send_sse_message({'error': f'Failed to switch handler: {str(switch_error)}'})
                     return
                 
                 # Step 3: Import into target database (reuse existing import logic)
                 logger.info(f"Step 3: Importing into {target_db_name}")
-                yield f"data: {json.dumps({'progress': 65, 'stage': 'import', 'message': 'Starting import...'})}\n\n"
+                yield send_sse_message({'progress': 65, 'stage': 'import', 'message': 'Starting import...'})
                 
                 try:
                     total_tables = len(export_data['tables'])
@@ -1436,7 +1454,7 @@ def create_app(initial_db_type, handler_name=None):
                             with target_handler_obj.engine.begin() as conn:
                                 for idx, table_data in enumerate(export_data['tables']):
                                     progress = 65 + int((idx / total_tables) * 30)  # 65-95%
-                                    yield f"data: {json.dumps({'progress': progress, 'stage': 'import', 'current': table_data['name'], 'message': f'Importing {table_data['name']}...'})}\n\n"
+                                    yield send_sse_message({'progress': progress, 'stage': 'import', 'current': table_data['name'], 'message': f'Importing {table_data["name"]}...'})
                                     
                                     table_name = table_data['name']
                                     
@@ -1637,7 +1655,7 @@ def create_app(initial_db_type, handler_name=None):
                                 try:
                                     for idx, table_data in enumerate(export_data['tables']):
                                         progress = 65 + int((idx / total_tables) * 30)
-                                        yield f"data: {json.dumps({'progress': progress, 'stage': 'import', 'current': table_data['name'], 'message': f'Importing {table_data['name']}...'})}\n\n"
+                                        yield send_sse_message({'progress': progress, 'stage': 'import', 'current': table_data['name'], 'message': f'Importing {table_data["name"]}...'})
                                         
                                         table_name = table_data['name']
                                         
@@ -1826,7 +1844,7 @@ def create_app(initial_db_type, handler_name=None):
                         # NoSQL import
                         for idx, table_data in enumerate(export_data['tables']):
                             progress = 65 + int((idx / total_tables) * 30)
-                            yield f"data: {json.dumps({'progress': progress, 'stage': 'import', 'current': table_data['name'], 'message': f'Importing {table_data['name']}...'})}\n\n"
+                            yield send_sse_message({'progress': progress, 'stage': 'import', 'current': table_data['name'], 'message': f'Importing {table_data["name"]}...'})
                             
                             collection_name = table_data['name']
                             
@@ -1885,7 +1903,7 @@ def create_app(initial_db_type, handler_name=None):
                                         # Don't fail the entire import - continue with warning
                     
                     # Import procedures
-                    yield f"data: {json.dumps({'progress': 95, 'stage': 'import', 'message': 'Importing procedures...'})}\n\n"
+                    yield send_sse_message({'progress': 95, 'stage': 'import', 'message': 'Importing procedures...'})
                     if hasattr(target_handler_obj, 'supports_procedures') and target_handler_obj.supports_procedures():
                         for proc in export_data.get('procedures', []):
                             try:
@@ -1913,21 +1931,21 @@ def create_app(initial_db_type, handler_name=None):
                             except Exception as proc_err:
                                 logger.warning(f"⚠️ Failed to import procedure {proc.get('name')}: {proc_err}")
                     
-                    yield f"data: {json.dumps({'progress': 100, 'stage': 'complete', 'target_db': target_db_name, 'message': 'Conversion complete!'})}\n\n"
+                    yield send_sse_message({'progress': 100, 'stage': 'complete', 'target_db': target_db_name, 'message': 'Conversion complete!'})
                     logger.info(f"✅ Conversion complete: {source_db} -> {target_db_name}")
                     
                 except Exception as import_error:
                     logger.error(f"Import failed: {import_error}")
                     import traceback
                     logger.error(traceback.format_exc())
-                    yield f"data: {json.dumps({'error': f'Import failed: {str(import_error)}'})}\n\n"
+                    yield send_sse_message({'error': f'Import failed: {str(import_error)}'})
                     return
             
             except Exception as e:
                 logger.error(f"❌ Conversion failed: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                yield send_sse_message({'error': str(e)})
         
         return Response(generate(), mimetype='text/event-stream')
     
