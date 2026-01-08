@@ -79,7 +79,10 @@ class MySQLHandler(DBHandler):
             username = keyring.get_password(self.KEYRING_SERVICE, self.KEYRING_USERNAME_KEY)
             password = keyring.get_password(self.KEYRING_SERVICE, self.KEYRING_PASSWORD_KEY)
             
-            has_creds = bool(username and password)
+            has_creds = (
+                username is not None and
+                password is not None
+            )
             needs = not has_creds
             
             self.logger.debug(f"MySQL credential status: has_creds={has_creds}, needs={needs}")
