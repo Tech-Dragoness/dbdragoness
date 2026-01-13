@@ -1301,11 +1301,6 @@ else:
     def create_view(self, view_name, view_definition):
         """NoSQL databases don't support views"""
         pass
-    
-    def copy_table(self, source_table, dest_table):
-        """Copy table structure and data - override in child classes for optimization"""
-        # Default implementation - handlers can override for better performance
-        raise NotImplementedError(f"{self.DB_NAME} must implement copy_table")
 
     def copy_triggers(self, source_table, dest_table):
         """NoSQL doesn't have triggers"""

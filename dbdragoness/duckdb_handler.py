@@ -701,6 +701,7 @@ else:
     def supports_non_pk_autoincrement(self):
         """DuckDB supports sequences on any integer column"""
         return True
+    
 
     def modify_table(self, old_table_name, new_table_name, new_columns):
         """Modify table with quoted identifiers - supports UNIQUE and AUTOINCREMENT"""
@@ -709,6 +710,12 @@ else:
 
         with self.engine.connect() as conn:
             try:
+                # 🔒 FORCE schema context (ABSOLUTELY REQUIRED on Linux)
+                if old_table_name.count('.') == 1:
+                    forced_schema = old_table_name.split('.')[0]
+                    conn.execute(text(f"SET schema '{forced_schema}'"))
+                    self.logger.debug(f"🔒 Forced schema context: {forced_schema}")
+
                 # ✅ CRITICAL FIX: Get fully qualified table name FIRST
                 old_table_qualified = self._get_fully_qualified_table_name(old_table_name, conn)
                 self.logger.debug(f"Resolved old table reference: {old_table_qualified}")
@@ -917,26 +924,27 @@ else:
                     else:
                         select_parts.append(f"{quoted_old} AS {self._quote_identifier(new_col_name)}")
             
-                # Copy data - ✅ USE FULLY QUALIFIED NAME
+                # Copy data - ✅ USE FULLY QUALIFIED NAME WITH PROPER QUOTING
                 if select_parts:
                     select_cols = ', '.join(select_parts)
                     insert_cols_str = ', '.join(insert_cols)
-                    # ✅ CRITICAL FIX: Use fully qualified name for source table
-                    # Resolve table dynamically for insert
-                    from sqlalchemy import inspect
-
-                    inspector = inspect(conn)
-                    all_tables = [t for t in inspector.get_table_names(schema=self.current_db)]
-                    if table_name_only in all_tables:
-                        source_table_ref = self._quote_identifier(table_name_only)
+                    
+                    # ✅ CRITICAL FIX: Quote the fully qualified source table name
+                    # Split the qualified name and quote each part separately
+                    if '.' in old_table_qualified:
+                        schema_part, table_part = old_table_qualified.rsplit('.', 1)
+                        # Remove any existing quotes before re-quoting
+                        schema_part = schema_part.strip('"')
+                        table_part = table_part.strip('"')
+                        source_table_ref = f'{self._quote_identifier(schema_part)}.{self._quote_identifier(table_part)}'
                     else:
-                        # fallback to fully qualified
-                        source_table_ref = old_table_qualified
-
+                        source_table_ref = self._quote_identifier(old_table_qualified)
+                    
+                    self.logger.debug(f"Copying data from {source_table_ref} to {quoted_temp}")
+                    
                     conn.execute(
                         text(f"INSERT INTO {quoted_temp} ({insert_cols_str}) SELECT {select_cols} FROM {source_table_ref}")
                     )
-
             
                 # Drop old and rename - ✅ USE SIMPLE NAME FOR DROP (we're in same database)
                 quoted_new = self._quote_identifier(new_table_name)
@@ -958,15 +966,19 @@ else:
             
                 conn.commit()
                 self.logger.debug(f"Successfully modified table {old_table_name} to {new_table_name}")
+                # ✅ NO CLEANUP NEEDED ON SUCCESS - temp table was renamed!
+                
             except Exception as e:
-                # ✅ CRITICAL: Clean up temporary table if creation succeeded
+                conn.rollback()  # ✅ Add explicit rollback
+                # ✅ CRITICAL: Clean up temporary table ONLY if it still exists (creation succeeded but later step failed)
                 try:
                     if 'temp_table_name' in locals():
                         quoted_temp = self._quote_identifier(temp_table_name)
                         conn.execute(text(f"DROP TABLE IF EXISTS {quoted_temp}"))
+                        conn.commit()  # ✅ Commit the cleanup
                         self.logger.debug(f"Cleaned up temporary table {temp_table_name}")
-                except Exception as e:
-                    self.logger.error(f"Error deleting temporary table: {e}")
+                except Exception as cleanup_err:  # ✅ Rename variable to avoid shadowing
+                    self.logger.warning(f"Could not clean up temporary table: {cleanup_err}")
                 
                 self.logger.error(f"Modify table error: {e}")
                 import traceback

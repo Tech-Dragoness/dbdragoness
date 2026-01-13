@@ -1179,8 +1179,8 @@ def create_app(initial_db_type, handler_name=None):
                     actual_handler = handler.handler if hasattr(handler, 'handler') else handler
                     db_name_type = actual_handler.DB_NAME if hasattr(actual_handler, 'DB_NAME') else 'SQLite'
                     
-                    # Close and dispose engine completely (cross-platform)
-                    if handler.engine:
+                    # ✅ Close and dispose engine completely (SQL databases only)
+                    if hasattr(handler, 'engine') and handler.engine:
                         handler.engine.dispose()
                         handler.engine = None
                     
