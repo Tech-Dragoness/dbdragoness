@@ -24,7 +24,7 @@
 ```bash
 pip install --upgrade dbdragoness
 ```
-Note: Latest version is 0.1.8
+Note: Latest version is 0.1.10
 
 ### Development Setup (For Developers & Academic Use)
 
