@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/Logo.png" width="160" alt="DBDragoness Logo">
-</p>
-
 <h1 align="center">DBDragoness 🐉</h1>
 
 <p align="center">
@@ -24,7 +20,7 @@
 ```bash
 pip install --upgrade dbdragoness
 ```
-Note: Latest version is 0.1.10
+Note: Latest version is 0.1.11
 
 ### Development Setup (For Developers & Academic Use)
 

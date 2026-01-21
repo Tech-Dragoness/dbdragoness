@@ -1,4 +1,3 @@
-# postgresql_handler.py - COMPLETE FIX with robust PK detection and proper constraints
 import hashlib
 import re
 import os
