@@ -5518,164 +5518,92 @@ def create_app(initial_db_type, handler_name=None):
                 'error': str(e)
             }), 500
         
-    @app.route('/api/autocomplete', methods=['POST'])
-    def api_autocomplete():
-        """JSON API: Get inline autocomplete suggestion (ghost text)"""
-        try:
-            data = request.get_json()
-            query = data.get('query', '').strip()
-            cursor_position = data.get('cursor_position', len(query))
-        
-            handler = app.config['HANDLER']
-            db_type = app.config['DB_TYPE']
-            current_db = handler.current_db
-        
-            # Get text up to cursor
-            text_before_cursor = query[:cursor_position]
-            text_upper = text_before_cursor.upper()
-        
-            # Get the last line being typed
-            lines = text_before_cursor.split('\n')
-            current_line = lines[-1]
-            current_line_upper = current_line.upper().strip()
-        
-            logger.debug(f"Autocomplete: query='{query[:50]}', current_line='{current_line}'")
-        
-            suggestion = ""
-        
-            # === PATTERN 1: "u" or "us" -> complete to "USE " ===
-            if current_line_upper in ['U', 'US'] and not current_line_upper.startswith('UPDATE'):
-                suggestion = "USE"[len(current_line_upper):] + " "
-                logger.debug(f"Pattern: USE start -> '{suggestion}'")
-        
-            # === PATTERN 2: "USE " or "USE db" -> suggest database name ===
-            elif current_line_upper.startswith('USE '):
-                dbs = handler.list_dbs()
-                if dbs:
-                    after_use = current_line[4:].strip()  # Get text after "USE "
-                    logger.debug(f"After USE: '{after_use}', Available DBs: {dbs}")
-                
-                    for db in dbs:
-                        if not after_use or db.upper().startswith(after_use.upper()):
-                            suggestion = db[len(after_use):]
-                            logger.debug(f"Suggesting DB: '{suggestion}'")
-                            break
-        
-            # === PATTERN 3: "s" or "se" -> complete to "SELECT * FROM " ===
-            elif current_line_upper in ['S', 'SE', 'SEL', 'SELE', 'SELEC']:
-                suggestion = "SELECT"[len(current_line_upper):] + " * FROM "
-                logger.debug(f"Pattern: SELECT start -> '{suggestion}'")
-        
-            # === PATTERN 4: "SELECT * FROM " or "SELECT * FROM ta" -> suggest table ===
-            elif 'FROM ' in current_line_upper:
-                if current_db:
-                    tables = handler.list_tables()
-                    logger.debug(f"Available tables: {tables}")
-                
-                    if tables:
-                        # Find what comes after the last "FROM "
-                        parts = current_line_upper.split('FROM ')
-                        after_from = current_line.split('FROM ')[-1].strip() if len(parts) > 1 else ""
-                    
-                        logger.debug(f"After FROM: '{after_from}'")
-                    
-                        for table in tables:
-                            if not after_from or table.upper().startswith(after_from.upper()):
-                                suggestion = table[len(after_from):]
-                                logger.debug(f"Suggesting table: '{suggestion}'")
-                                break
-                else:
-                    logger.debug("No current_db selected")
-        
-            # === PATTERN 5: "INSERT INTO " -> suggest table name ===
-            elif 'INSERT INTO ' in current_line_upper:
-                if current_db:
-                    tables = handler.list_tables()
-                    if tables:
-                        after_into = current_line.split('INSERT INTO ')[-1].strip()
-                        for table in tables:
-                            if not after_into or table.upper().startswith(after_into.upper()):
-                                suggestion = table[len(after_into):] + " VALUES ()"
-                                break
-        
-            # === PATTERN 6: "UPDATE " -> suggest table name ===
-            elif current_line_upper.startswith('UPDATE ') and ' SET ' not in current_line_upper:
-                if current_db:
-                    tables = handler.list_tables()
-                    if tables:
-                        after_update = current_line[7:].strip()  # After "UPDATE "
-                        for table in tables:
-                            if not after_update or table.upper().startswith(after_update.upper()):
-                                suggestion = table[len(after_update):] + " SET "
-                                break
-        
-            # === PATTERN 7: "DELETE FROM " -> suggest table name ===
-            elif 'DELETE FROM ' in current_line_upper:
-                if current_db:
-                    tables = handler.list_tables()
-                    if tables:
-                        after_from = current_line.split('DELETE FROM ')[-1].strip()
-                        for table in tables:
-                            if not after_from or table.upper().startswith(after_from.upper()):
-                                suggestion = table[len(after_from):] + " WHERE "
-                                break
-        
-            # === PATTERN 8: Empty or just var(--primaryText)space -> suggest SELECT ===
-            elif not query.strip():
-                suggestion = "SELECT * FROM "
-        
-            logger.debug(f"Final suggestion: '{suggestion}'")
-        
-            return jsonify({
-                'success': True,
-                'suggestion': suggestion
-            })
-        
-        except Exception as e:
-            logger.error(f"Autocomplete error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return jsonify({
-                'success': False,
-                'suggestion': ""
-            })
-            
     @app.route('/api/autocomplete/history', methods=['POST'])
     def api_autocomplete_history():
-        """JSON API: Get autocomplete suggestions from query history"""
+        """
+        JSON API: Get autocomplete suggestions from query history with word prediction.
+        Now supports matching individual commands within multi-line queries!
+        """
         try:
             data = request.get_json()
             partial_query = data.get('query', '').strip()
             handler_name = app.config['CURRENT_HANDLER_NAME']
             limit = data.get('limit', 5)
-        
+            
             if not partial_query or len(partial_query) < 2:
                 return jsonify({
                     'success': True,
-                    'suggestions': []
+                    'suggestions': [],
+                    'next_words': []
                 })
-        
-            # Get suggestions from history
-            suggestions = query_history_manager.get_realtime_suggestions(
+            
+            # Get suggestions from history (now returns dict with suggestions and next_words)
+            result = query_history_manager.get_realtime_suggestions(
                 handler_name, 
                 partial_query, 
                 limit
             )
-        
-            logger.debug(f"Autocomplete: Found {len(suggestions)} suggestions for '{partial_query[:50]}'")
-        
+            
+            suggestions = result.get('suggestions', [])
+            next_words = result.get('next_words', [])
+            
+            # Convert suggestions from objects to strings (frontend expects strings)
+            # But keep the most relevant info - prioritize individual commands
+            suggestion_strings = []
+            seen = set()
+            
+            for s in suggestions:
+                if isinstance(s, dict):
+                    query_text = s.get('query', '')
+                    suggestion_type = s.get('type', 'unknown')
+                    
+                    # Avoid duplicates
+                    if query_text and query_text not in seen:
+                        suggestion_strings.append(query_text)
+                        seen.add(query_text)
+                else:
+                    # Fallback for legacy format
+                    if s and s not in seen:
+                        suggestion_strings.append(s)
+                        seen.add(s)
+            
+            logger.debug(f"Autocomplete: Found {len(suggestion_strings)} suggestions, {len(next_words)} next words for '{partial_query[:50]}'")
+            
             return jsonify({
                 'success': True,
-                'suggestions': suggestions
+                'suggestions': suggestion_strings,
+                'next_words': next_words
             })
-        
+            
         except Exception as e:
             logger.error(f"Autocomplete history error: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return jsonify({
                 'success': False,
-                'suggestions': []
+                'suggestions': [],
+                'next_words': []
+            })
+
+
+    # Optional: Add a new endpoint to get command statistics
+    @app.route('/api/query-stats/<handler_name>', methods=['GET'])
+    def get_query_stats(handler_name):
+        """Get statistics about query/command usage for a specific handler"""
+        try:
+            stats = query_history_manager.get_command_statistics(handler_name)
+            
+            return jsonify({
+                'success': True,
+                'handler': handler_name,
+                'stats': stats
+            })
+            
+        except Exception as e:
+            logger.error(f"Query stats error: {e}")
+            return jsonify({
+                'success': False,
+                'error': str(e)
             })
         
     @app.route('/api/databases/search', methods=['GET'])

@@ -59,7 +59,10 @@
     "SELECT * FROM orders;",
     "SELECT\n    PARTITION_NAME,\n    TABLE_ROWS\nFROM information_schema.PARTITIONS\nWHERE TABLE_NAME = 'orders';",
     "SELECT * FROM orders WHERE order_date < '2025-01-01';",
-    "CREATE TABLE orders (\n    id INT NOT NULL,\n    order_date DATE NOT NULL,\n    amount DECIMAL(10,2),\n    PRIMARY KEY (id, order_date)\n);"
+    "CREATE TABLE orders (\n    id INT NOT NULL,\n    order_date DATE NOT NULL,\n    amount DECIMAL(10,2),\n    PRIMARY KEY (id, order_date)\n);",
+    "use bookstore_db;\nselect * from cart;",
+    "use bookstore_db;\nselect * from users;",
+    "use bookstore_db;\nselect * from users;\nSELECT * FROM orders;"
   ],
   "PostgreSQL": [
     "CREATE TABLE check_test (\n    id INT PRIMARY KEY,\n    age INT CHECK (age >= 18),\n    grade CHAR(1) CHECK (grade IN ('A', 'B', 'C'))\n);",
