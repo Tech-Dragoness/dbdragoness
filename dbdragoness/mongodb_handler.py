@@ -1299,6 +1299,10 @@ except ServerSelectionTimeoutError:
     def supports_user_management(self):
         """MongoDB supports user management"""
         return True
+    
+    def requires_credentials(self):
+        """MongoDB doesn't require credentials for user login in this setup"""
+        return False
 
     def list_users(self):
         """List all MongoDB users in current database"""

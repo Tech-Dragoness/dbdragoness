@@ -2027,6 +2027,10 @@ SELECT update_marks(1, 95);"""
     def supports_user_management(self):
         """PostgreSQL supports user management"""
         return True
+    
+    def requires_credentials(self):
+        """MongoDB doesn't require credentials for user login in this setup"""
+        return True
 
     def list_users(self):
         """List all PostgreSQL users/roles"""

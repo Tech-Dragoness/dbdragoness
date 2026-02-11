@@ -208,6 +208,12 @@ class SQLHandler(DBHandler):
         if hasattr(self.handler, 'supports_user_management'):
             return self.handler.supports_user_management()
         return False
+    
+    def requires_credentials(self):
+        """Check if handler requires credentials"""
+        if hasattr(self.handler, 'requires_credentials'):
+            return self.handler.requires_credentials()
+        return False
 
     def list_users(self):
         """List all database users"""

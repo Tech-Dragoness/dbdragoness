@@ -1050,6 +1050,10 @@ else:
     def supports_user_management(self):
         """Return True if database supports user management"""
         return False
+    
+    def requires_credentials(self):
+        """MongoDB doesn't require credentials for user login in this setup"""
+        return False
 
     def list_users(self):
         """List all database users - override in child classes"""

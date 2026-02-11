@@ -546,9 +546,13 @@ def create_app(initial_db_type, handler_name=None):
                     if db_name in app.config['HANDLER'].list_dbs():
                         return jsonify({'success': False, 'error': 'Database already exists'}), 400
                     
-                    app.config['HANDLER'].create_db(db_name)
-                    logger.debug(f"API: Created database {db_name}")
-                    return jsonify({'success': True, 'message': f'Database {db_name} created'})
+                    try:
+                        app.config['HANDLER'].create_db(db_name)
+                        logger.debug(f"API: Created database {db_name}")
+                    except Exception as create_error:
+                        error_msg = str(create_error)
+                        logger.error(f"Database creation error: {error_msg}")
+                        return jsonify({'success': False, 'error': error_msg}), 400
                 
                 elif action == 'delete':
                     app.config['HANDLER'].delete_db(db_name)
@@ -4224,8 +4228,8 @@ def create_app(initial_db_type, handler_name=None):
                 logger.error(f"Create table error: {str(e)}")
                 return jsonify({
                     'success': False,
-                    'error': f'Failed to create table: {str(e)}'
-                }), 500
+                    'error': str(e)  # Remove the 'Failed to create table:' prefix
+                }), 400  # Changed from 500 to 400 since this is a validation/user error
 
         except Exception as e:
             logger.error(f"❌ API call failed: /api/db/{db_name}/create_table - {e}")
@@ -4758,10 +4762,16 @@ def create_app(initial_db_type, handler_name=None):
                 except Exception as e:
                     logger.error(f"Error listing users: {str(e)}")
         
+            # Check if handler requires credentials for users
+            requires_credentials = True  # Default to True for security
+            if hasattr(handler, 'requires_credentials'):
+                requires_credentials = handler.requires_credentials()
+            
             return jsonify({
                 'success': True,
                 'users': users,
                 'supports_users': supports_users,
+                'requires_credentials': requires_credentials,
                 'db_type': app.config['DB_TYPE'],
                 'handler': app.config['CURRENT_HANDLER_NAME']
             })
