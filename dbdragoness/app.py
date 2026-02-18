@@ -549,6 +549,7 @@ def create_app(initial_db_type, handler_name=None):
                     try:
                         app.config['HANDLER'].create_db(db_name)
                         logger.debug(f"API: Created database {db_name}")
+                        return jsonify({'success': True, 'message': f'Database {db_name} created successfully'}), 201
                     except Exception as create_error:
                         error_msg = str(create_error)
                         logger.error(f"Database creation error: {error_msg}")
@@ -817,16 +818,18 @@ def create_app(initial_db_type, handler_name=None):
                                             check_info['column'],
                                             check_info['expression']
                                         )
-                                    if hasattr(handler, 'create_check_constraint'):
+                                        logger.info(f"✅ Applied CHECK on {check_info['column']}: {check_info['expression']}")
+                                        successful_checks += 1
+                                    elif hasattr(actual_handler, 'create_check_constraint'):
                                         logger.info("Trying create_check_constraint as fallback...")
                                         # Handler requires table recreation to add CHECK constraint
-                                        handler.create_check_constraint(
+                                        actual_handler.create_check_constraint(
                                             table,
                                             check_info['column'],
                                             check_info['expression'],
                                             conn  # Pass connection for transaction consistency
                                         )
-                                        logger.info(f"🎉 Fallback call succeeded for {check_info['column']}")
+                                        logger.info(f"✅ Applied CHECK on {check_info['column']}: {check_info['expression']}")
                                         successful_checks += 1
                                     else:
                                         # Handler doesn't support CHECK constraints
@@ -901,122 +904,55 @@ def create_app(initial_db_type, handler_name=None):
                         try:
                             app.config['HANDLER'].switch_db(old_name)
                             
-                            # Get indexes from old table
-                            with app.config['HANDLER']._get_connection() as conn:
-                                indexes_copied = False
-                                
-                                # Try database-specific index queries
+                            # Use handler method to get indexes (database-agnostic)
+                            if hasattr(actual_handler, 'get_table_indexes'):
                                 try:
-                                    # Check database type by checking if methods exist
-                                    if hasattr(actual_handler, 'DB_NAME'):
-                                        if actual_handler.DB_NAME == 'SQLite':
-                                            idx_result = conn.execute(text(f"PRAGMA index_list({table})")).fetchall()
-                                            for idx_row in idx_result:
-                                                idx_name = idx_row[1]
-                                                is_unique = idx_row[2] == 1
-                                                
-                                                # Skip auto-created indexes
-                                                if idx_name.startswith('sqlite_autoindex'):
-                                                    continue
-                                                
-                                                # Get index columns
-                                                idx_cols = conn.execute(text(f"PRAGMA index_info({idx_name})")).fetchall()
-                                                col_names = [row[2] for row in idx_cols]
-                                                
-                                                # Recreate in new database
-                                                app.config['HANDLER'].switch_db(new_name)
-                                                unique_str = "UNIQUE" if is_unique else ""
-                                                cols_str = ", ".join([actual_handler._quote_identifier(c) for c in col_names])
-                                                quoted_table_idx = actual_handler._quote_identifier(table)
-                                                quoted_idx = actual_handler._quote_identifier(idx_name)
-                                                
-                                                create_idx_sql = f"CREATE {unique_str} INDEX {quoted_idx} ON {quoted_table_idx} ({cols_str})"
-                                                with app.config['HANDLER']._get_connection() as conn2:
-                                                    conn2.execute(text(create_idx_sql))
-                                                    conn2.commit()
-                                                logger.debug(f"Copied index: {idx_name}")
-                                                app.config['HANDLER'].switch_db(old_name)
-                                            indexes_copied = True
+                                    indexes = actual_handler.get_table_indexes(table)
+                                    
+                                    if indexes:
+                                        # Recreate indexes in new database
+                                        app.config['HANDLER'].switch_db(new_name)
                                         
-                                        elif actual_handler.DB_NAME == 'PostgreSQL':
-                                            idx_result = conn.execute(text("""
-                                                SELECT indexname, indexdef 
-                                                FROM pg_indexes 
-                                                WHERE tablename = :t AND schemaname = 'public'
-                                            """), {'t': table}).fetchall()
-                                            
-                                            for idx_row in idx_result:
-                                                idx_name = idx_row[0]
-                                                idx_def = idx_row[1]
+                                        for index_info in indexes:
+                                            try:
+                                                idx_name = index_info['name']
+                                                idx_columns = index_info['columns']
+                                                is_unique = index_info.get('unique', False)
                                                 
-                                                # Skip primary key indexes
-                                                if 'PRIMARY KEY' in idx_def.upper() or '_pkey' in idx_name:
-                                                    continue
-                                                
-                                                # Recreate in new database
-                                                app.config['HANDLER'].switch_db(new_name)
-                                                with app.config['HANDLER']._get_connection() as conn2:
-                                                    conn2.execute(text(idx_def))
-                                                    conn2.commit()
-                                                logger.debug(f"Copied index: {idx_name}")
-                                                app.config['HANDLER'].switch_db(old_name)
-                                            indexes_copied = True
+                                                # Use handler method to create index (database-agnostic)
+                                                if hasattr(actual_handler, 'create_index'):
+                                                    actual_handler.create_index(
+                                                        table_name=table,
+                                                        index_name=idx_name,
+                                                        columns=idx_columns,
+                                                        unique=is_unique
+                                                    )
+                                                    logger.debug(f"Copied index: {idx_name}")
+                                                else:
+                                                    # Fallback: Build CREATE INDEX SQL using handler's quoting
+                                                    unique_str = "UNIQUE" if is_unique else ""
+                                                    cols_str = ", ".join([actual_handler._quote_identifier(c) for c in idx_columns])
+                                                    quoted_table_idx = actual_handler._quote_identifier(table)
+                                                    quoted_idx = actual_handler._quote_identifier(idx_name)
+                                                    
+                                                    create_idx_sql = f"CREATE {unique_str} INDEX {quoted_idx} ON {quoted_table_idx} ({cols_str})"
+                                                    with app.config['HANDLER']._get_connection() as conn:
+                                                        conn.execute(text(create_idx_sql))
+                                                        conn.commit()
+                                                    logger.debug(f"Copied index: {idx_name}")
+                                                    
+                                            except Exception as idx_create_error:
+                                                logger.warning(f"Failed to create index {idx_name}: {idx_create_error}")
                                         
-                                        elif actual_handler.DB_NAME == 'MySQL':
-                                            idx_result = conn.execute(text(f"SHOW INDEX FROM {table} WHERE Key_name != 'PRIMARY'")).fetchall()
-                                            
-                                            # Group by index name
-                                            indexes = {}
-                                            for row in idx_result:
-                                                idx_name = row[2]
-                                                col_name = row[4]
-                                                is_unique = row[1] == 0
-                                                
-                                                if idx_name not in indexes:
-                                                    indexes[idx_name] = {'cols': [], 'unique': is_unique}
-                                                indexes[idx_name]['cols'].append(col_name)
-                                            
-                                            # Recreate indexes
-                                            app.config['HANDLER'].switch_db(new_name)
-                                            for idx_name, idx_info in indexes.items():
-                                                unique_str = "UNIQUE" if idx_info['unique'] else ""
-                                                cols_str = ", ".join([f"`{c}`" for c in idx_info['cols']])
-                                                create_idx_sql = f"CREATE {unique_str} INDEX `{idx_name}` ON `{table}` ({cols_str})"
-                                                with app.config['HANDLER']._get_connection() as conn2:
-                                                    conn2.execute(text(create_idx_sql))
-                                                    conn2.commit()
-                                                logger.debug(f"Copied index: {idx_name}")
-                                                app.config['HANDLER'].switch_db(old_name)
-                                            indexes_copied = True
+                                        app.config['HANDLER'].switch_db(old_name)
+                                    else:
+                                        logger.debug(f"No indexes found for table {table}")
                                         
-                                        elif actual_handler.DB_NAME == 'DuckDB':
-                                            # DuckDB index query
-                                            idx_result = conn.execute(text("""
-                                                SELECT index_name, is_unique, sql
-                                                FROM duckdb_indexes()
-                                                WHERE table_name = :t
-                                            """), {'t': table}).fetchall()
-                                            
-                                            for idx_row in idx_result:
-                                                idx_name = idx_row[0]
-                                                idx_sql = idx_row[2]
-                                                
-                                                # Skip primary key indexes
-                                                if 'PRIMARY KEY' in str(idx_sql).upper():
-                                                    continue
-                                                
-                                                # Recreate in new database
-                                                app.config['HANDLER'].switch_db(new_name)
-                                                with app.config['HANDLER']._get_connection() as conn2:
-                                                    conn2.execute(text(idx_sql))
-                                                    conn2.commit()
-                                                logger.debug(f"Copied index: {idx_name}")
-                                                app.config['HANDLER'].switch_db(old_name)
-                                            indexes_copied = True
-                                            
-                                except Exception as db_specific_error:
-                                    logger.debug(f"Database-specific index query failed: {db_specific_error}")
-                        
+                                except Exception as get_idx_error:
+                                    logger.debug(f"Failed to get indexes for {table}: {get_idx_error}")
+                            else:
+                                logger.debug(f"Handler does not support get_table_indexes method")
+
                         except Exception as idx_error:
                             logger.warning(f"Failed to copy indexes for {table}: {idx_error}")
                             
@@ -1619,7 +1555,7 @@ def create_app(initial_db_type, handler_name=None):
                                                         })
                                     
                                     # Apply CHECK constraints AFTER data copy
-                                    if check_constraints_to_apply:
+                                    if check_constraints_to_apply and not getattr(actual_handler, 'check_constraints_inline', lambda: False)():
                                         logger.info(f"Found {len(check_constraints_to_apply)} CHECK constraints to apply to {table_name}")
                                         for check_info in check_constraints_to_apply:
                                             logger.info(f"  - Column '{check_info['column']}': {check_info['expression']}")
@@ -6887,11 +6823,16 @@ def create_app(initial_db_type, handler_name=None):
         """
         actual_handler = handler.handler if hasattr(handler, 'handler') else handler
         
+        # ✅ CRITICAL: Check if handler has its own table creation method
+        if hasattr(actual_handler, 'create_table_with_constraints'):
+            logger.debug(f"Using handler-specific table creation for {table_name}")
+            return actual_handler.create_table_with_constraints(table_name, schema, conn)
+        
         # Get database type
         db_type_name = None
         if hasattr(actual_handler, 'DB_NAME'):
             db_type_name = actual_handler.DB_NAME
-        
+                
         # Quote table name properly
         if hasattr(actual_handler, '_quote_identifier'):
             quoted_table = actual_handler._quote_identifier(table_name)

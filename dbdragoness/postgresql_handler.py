@@ -3288,3 +3288,74 @@ with engine.connect() as conn:
             'changes': changes if changes else [f"Database analyzed for {normal_form} - no automated changes made"],
             'new_tables': new_tables
         }
+        
+    def get_table_indexes(self, table_name):
+        """
+        Get all non-primary key indexes for a table
+        Returns: List of dicts with 'name', 'columns', 'unique'
+        """
+        indexes = []
+        
+        with self._get_connection() as conn:
+            # Get indexes from pg_indexes
+            idx_result = conn.execute(text("""
+                SELECT 
+                    indexname,
+                    indexdef,
+                    schemaname
+                FROM pg_indexes 
+                WHERE tablename = :t AND schemaname = 'public'
+            """), {'t': table_name}).fetchall()
+            
+            for idx_row in idx_result:
+                idx_name = idx_row[0]
+                idx_def = idx_row[1]
+                
+                # Skip primary key indexes
+                if 'PRIMARY KEY' in idx_def.upper() or '_pkey' in idx_name:
+                    continue
+                
+                # Parse index definition to extract columns and uniqueness
+                is_unique = 'UNIQUE' in idx_def.upper()
+                
+                # Extract column names from index definition
+                # Pattern: CREATE [UNIQUE] INDEX ... ON table (col1, col2, ...)
+                import re
+                col_match = re.search(r'\((.*?)\)', idx_def)
+                col_names = []
+                if col_match:
+                    cols_str = col_match.group(1)
+                    # Remove quotes and split by comma
+                    col_names = [c.strip().strip('"') for c in cols_str.split(',')]
+                
+                if col_names:
+                    indexes.append({
+                        'name': idx_name,
+                        'columns': col_names,
+                        'unique': is_unique
+                    })
+        
+        return indexes
+
+    def create_index(self, table_name, index_name, columns, unique=False):
+        """
+        Create an index on a table
+        
+        Args:
+            table_name: Name of the table
+            index_name: Name of the index
+            columns: List of column names
+            unique: Whether the index should be unique
+        """
+        with self._get_connection() as conn:
+            unique_str = "UNIQUE" if unique else ""
+            cols_str = ", ".join([self._quote_identifier(c) for c in columns])
+            quoted_table = self._quote_identifier(table_name)
+            quoted_idx = self._quote_identifier(index_name)
+            
+            create_idx_sql = f"CREATE {unique_str} INDEX {quoted_idx} ON {quoted_table} ({cols_str})"
+            conn.execute(text(create_idx_sql))
+            conn.commit()
+            
+    def check_constraints_inline(self):
+        return True

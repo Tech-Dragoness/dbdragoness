@@ -66,6 +66,11 @@ with engine.connect() as conn:
                 self.engine.dispose()
                 self.engine = None
             self.current_db = None
+        else:
+            # Database being deleted is not the active one — create a temporary
+            # engine just to dispose it, releasing any lingering Windows file handle
+            temp_engine = create_engine(f"sqlite:///{db_path}")
+            temp_engine.dispose()
     
         # Add delay to ensure Windows releases file handle
         time.sleep(0.2)
@@ -1652,3 +1657,59 @@ with engine.connect() as conn:
             'changes': changes if changes else [f"Database analyzed for {normal_form} - no automated changes made"],
             'new_tables': new_tables
         }
+        
+    def get_table_indexes(self, table_name):
+        """
+        Get all non-primary key indexes for a table
+        Returns: List of dicts with 'name', 'columns', 'unique'
+        """
+        indexes = []
+        
+        # ✅ FIXED: Use self.engine.connect() directly
+        with self.engine.connect() as conn:
+            # Get list of indexes
+            idx_result = conn.execute(text(f"PRAGMA index_list({table_name})")).fetchall()
+            
+            for idx_row in idx_result:
+                idx_name = idx_row[1]
+                is_unique = idx_row[2] == 1
+                
+                # Skip auto-created indexes
+                if idx_name.startswith('sqlite_autoindex'):
+                    continue
+                
+                # Get index columns
+                idx_cols = conn.execute(text(f"PRAGMA index_info({idx_name})")).fetchall()
+                col_names = [row[2] for row in idx_cols]
+                
+                indexes.append({
+                    'name': idx_name,
+                    'columns': col_names,
+                    'unique': is_unique
+                })
+        
+        return indexes
+
+    def create_index(self, table_name, index_name, columns, unique=False):
+        """
+        Create an index on a table
+        
+        Args:
+            table_name: Name of the table
+            index_name: Name of the index
+            columns: List of column names
+            unique: Whether the index should be unique
+        """
+        # ✅ FIXED: Use self.engine.connect() directly
+        with self.engine.connect() as conn:
+            unique_str = "UNIQUE" if unique else ""
+            cols_str = ", ".join([self._quote_identifier(c) for c in columns])
+            quoted_table = self._quote_identifier(table_name)
+            quoted_idx = self._quote_identifier(index_name)
+            
+            create_idx_sql = f"CREATE {unique_str} INDEX {quoted_idx} ON {quoted_table} ({cols_str})"
+            conn.execute(text(create_idx_sql))
+            conn.commit()
+
+    def check_constraints_inline(self):
+        return True

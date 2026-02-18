@@ -14,7 +14,8 @@
     "create database trial1;",
     "insert into table1 values (66, 12)",
     "insert into table1 values(66, 'Tulika')",
-    "INSERT INTO trial1 (name) VALUES ('name');"
+    "INSERT INTO trial1 (name) VALUES ('name');",
+    "select * from table2;"
   ],
   "MySQL": [
     "SHOW CREATE TABLE table2",
@@ -138,7 +139,8 @@
     "db.createCollection(\"sales\")",
     "db.sales.insertMany([\n  { product: \"Laptop\", category: \"Electronics\", price: 1200, quantity: 5, date: \"2024-01-15\", region: \"North\" },\n  { product: \"Mouse\", category: \"Electronics\", price: 25, quantity: 50, date: \"2024-01-16\", region: \"North\" },\n  { product: \"Keyboard\", category: \"Electronics\", price: 75, quantity: 30, date: \"2024-01-17\", region: \"South\" },\n  { product: \"Monitor\", category: \"Electronics\", price: 300, quantity: 15, date: \"2024-01-18\", region: \"East\" },\n  { product: \"Desk\", category: \"Furniture\", price: 450, quantity: 8, date: \"2024-01-19\", region: \"West\" },\n  { product: \"Chair\", category: \"Furniture\", price: 200, quantity: 20, date: \"2024-01-20\", region: \"North\" },\n  { product: \"Notebook\", category: \"Stationery\", price: 5, quantity: 200, date: \"2024-01-21\", region: \"South\" },\n  { product: \"Pen\", category: \"Stationery\", price: 2, quantity: 500, date: \"2024-01-22\", region: \"East\" },\n  { product: \"Tablet\", category: \"Electronics\", price: 600, quantity: 12, date: \"2024-01-23\", region: \"West\" },\n  { product: \"Lamp\", category: \"Furniture\", price: 80, quantity: 25, date: \"2024-01-24\", region: \"North\" }\n])",
     "db.collection_name.deleteMany({})",
-    "db.trial1.deleteMany({})"
+    "db.trial1.deleteMany({})",
+    "{\"table\" : \"collection1\", \"condition\" : \"\"}"
   ],
   "TinyDB": [
     "select * from table1;",

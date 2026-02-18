@@ -130,7 +130,7 @@ def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, u
     Examples:
         dbdragoness                      # Interactive mode
         dbdragoness --type sql                    # Open SQL homepage
-        dbdragoness --type sql --handler     # Open directly into MySQL
+        dbdragoness --type sql --handler     # Open directly into a DB
     """
     
     # If subcommand invoked, don't run main logic

@@ -3007,3 +3007,141 @@ with engine.connect() as conn:
             'changes': changes if changes else [f"Database analyzed for {normal_form} - no automated changes made"],
             'new_tables': new_tables
         }
+        
+    def get_table_indexes(self, table_name):
+        """
+        Get all non-primary key indexes for a table
+        Returns: List of dicts with 'name', 'columns', 'unique'
+        """
+        indexes = []
+        
+        with self._get_connection() as conn:
+            # Get indexes using SHOW INDEX
+            idx_result = conn.execute(
+                text(f"SHOW INDEX FROM {self._quote_identifier(table_name)} WHERE Key_name != 'PRIMARY'")
+            ).fetchall()
+            
+            # Group by index name
+            indexes_dict = {}
+            for row in idx_result:
+                idx_name = row[2]
+                col_name = row[4]
+                is_unique = row[1] == 0
+                
+                if idx_name not in indexes_dict:
+                    indexes_dict[idx_name] = {
+                        'name': idx_name,
+                        'columns': [],
+                        'unique': is_unique
+                    }
+                indexes_dict[idx_name]['columns'].append(col_name)
+            
+            # Convert dict to list
+            indexes = list(indexes_dict.values())
+        
+        return indexes
+
+    def create_index(self, table_name, index_name, columns, unique=False):
+        """
+        Create an index on a table
+        
+        Args:
+            table_name: Name of the table
+            index_name: Name of the index
+            columns: List of column names
+            unique: Whether the index should be unique
+        """
+        with self._get_connection() as conn:
+            unique_str = "UNIQUE" if unique else ""
+            cols_str = ", ".join([self._quote_identifier(c) for c in columns])
+            quoted_table = self._quote_identifier(table_name)
+            quoted_idx = self._quote_identifier(index_name)
+            
+            create_idx_sql = f"CREATE {unique_str} INDEX {quoted_idx} ON {quoted_table} ({cols_str})"
+            conn.execute(text(create_idx_sql))
+            conn.commit()
+            
+    def create_table_with_constraints(self, table_name, schema, conn=None):
+        """
+        DuckDB-specific table creation that properly handles CHECK constraints
+        This overrides the generic table creation in app.py
+        """
+        should_close = False
+        if conn is None:
+            conn = self.engine.connect()
+            should_close = True
+        
+        try:
+            quoted_table = self._quote_identifier(table_name)
+            
+            # Build column definitions
+            columns_def = []
+            table_level_checks = []
+            
+            # Detect composite primary key
+            pk_columns = [col for col in schema if col.get('primary_key') or col.get('pk')]
+            has_composite_pk = len(pk_columns) > 1
+            
+            for col in schema:
+                col_name = col['name']
+                col_type = col['type']
+                # Fix bare VARCHAR for MySQL (requires length)
+                if col_type.upper() == 'VARCHAR' or (col_type.upper().startswith('VARCHAR') and '(' not in col_type):
+                    col_type = 'VARCHAR(255)'
+                quoted_col = self._quote_identifier(col_name)
+                
+                col_def = f"{quoted_col} {col_type}"
+                
+                is_primary = col.get('primary_key') or col.get('pk')
+                
+                # Handle primary key
+                if is_primary and not has_composite_pk:
+                    col_def += " PRIMARY KEY"
+                
+                # Handle NOT NULL
+                if not col.get('nullable', True) and not is_primary:
+                    col_def += " NOT NULL"
+                
+                # Handle UNIQUE
+                if col.get('unique') and not is_primary:
+                    col_def += " UNIQUE"
+                
+                # ✅ CRITICAL: For DuckDB, add CHECK constraints at TABLE level, not column level
+                if col.get('check_constraint'):
+                    check_expr = col['check_constraint']
+                    # Add to table-level constraints
+                    constraint_name = f"check_{table_name}_{col_name}"
+                    table_level_checks.append(f"CONSTRAINT {self._quote_identifier(constraint_name)} CHECK ({check_expr})")
+                    self.logger.debug(f"✅ DuckDB: Adding table-level CHECK constraint: {constraint_name} - {check_expr}")
+                
+                columns_def.append(col_def)
+            
+            # Add composite primary key if needed
+            if has_composite_pk:
+                pk_col_names = [col['name'] for col in pk_columns]
+                quoted_pk_cols = ', '.join([self._quote_identifier(name) for name in pk_col_names])
+                columns_def.append(f"PRIMARY KEY ({quoted_pk_cols})")
+            
+            # Add all table-level CHECK constraints
+            columns_def.extend(table_level_checks)
+            
+            # Create table
+            col_def_str = ', '.join(columns_def)
+            create_sql = f"CREATE TABLE IF NOT EXISTS {quoted_table} ({col_def_str})"
+            
+            self.logger.info(f"DuckDB: Creating table with SQL: {create_sql}")
+            
+            conn.execute(text(create_sql))
+            if should_close:
+                conn.commit()
+            
+            self.logger.info(f"✅ DuckDB: Successfully created table {table_name} with {len(table_level_checks)} CHECK constraint(s)")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ DuckDB: Failed to create table {table_name}: {e}")
+            raise
+        finally:
+            if should_close:
+                conn.close()

@@ -390,3 +390,28 @@ class SQLHandler(DBHandler):
         This is a simplified implementation - real normalization requires deep analysis.
         """
         return self.handler.normalize_database(normal_form, analysis_data)
+    
+    def get_table_indexes(self, table_name):
+        """
+        Get all non-primary key indexes for a table
+        Returns: List of dicts with 'name', 'columns', 'unique'
+        """
+        return self.handler.get_table_indexes(table_name)
+
+    def create_index(self, table_name, index_name, columns, unique=False):
+        """
+        Create an index on a table
+        
+        Args:
+            table_name: Name of the table
+            index_name: Name of the index
+            columns: List of column names
+            unique: Whether the index should be unique
+        """
+        self.handler.create_index(table_name, index_name, columns, unique)
+        
+    def check_constraints_inline(self):
+        if hasattr(self.handler, 'check_constraints_inline'):
+            return self.handler.check_constraints_inline()
+        return False
+            

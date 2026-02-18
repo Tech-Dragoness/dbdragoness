@@ -1599,11 +1599,13 @@ with engine.connect() as conn:
             if not self.validate_check_constraint(expression):
                 raise ValueError("Invalid CHECK constraint expression")
             
-            # ✅ CRITICAL FIX: Use provided connection or create one
+            # ✅ CRITICAL FIX: Use provided connection or create one WITH transaction
             should_close = False
             if conn is None:
+                # Create connection and explicitly begin transaction
                 conn = self.engine.connect()
                 should_close = True
+                # SQLAlchemy automatically starts transaction - no manual BEGIN needed
             
             try:
                 # ✅ NEW: Detect the actual schema location of the table FIRST
@@ -1638,7 +1640,10 @@ with engine.connect() as conn:
                     raise ValueError(f"Column {column_name} not found in table {table_name}")
                 
                 # Rebuild column definitions with CHECK - CRITICAL: Must include autoincrement handling
+                # ✅ CRITICAL: Build CHECK constraints as TABLE-LEVEL constraints with explicit names
                 column_defs = []
+                table_level_constraints = []
+                
                 for col in schema:
                     col_name_quoted = self._quote_identifier(col['name'])
                     col_type = col['type']
@@ -1659,11 +1664,18 @@ with engine.connect() as conn:
                         if col.get('unique'):
                             col_def += " UNIQUE"
                     
-                    # Add CHECK constraint
+                    # ✅ CRITICAL: Add CHECK as a TABLE-LEVEL constraint with explicit name
                     if col.get('check_constraint'):
-                        col_def += f" CHECK ({col['check_constraint']})"
+                        constraint_name = f"check_{table_name}_{col['name']}"
+                        quoted_constraint = self._quote_identifier(constraint_name)
+                        check_clause = f"CONSTRAINT {quoted_constraint} CHECK ({col['check_constraint']})"
+                        table_level_constraints.append(check_clause)
+                        self.logger.debug(f"✅ Added table-level CHECK constraint: {constraint_name}")
                     
                     column_defs.append(col_def)
+                
+                # ✅ Append all table-level constraints after columns
+                column_defs.extend(table_level_constraints)
                 
                 if not column_defs:
                     raise ValueError(f"No valid column definitions generated for table {table_name}")
@@ -1679,16 +1691,22 @@ with engine.connect() as conn:
                     raise
                     
                 # Create temp table name
-                import os
                 import secrets
                 temp_table_name = f"temp_{table_name}_{secrets.token_hex(4)}"
                 quoted_temp = self._quote_identifier(temp_table_name)
 
                 # Use the provided connection to rebuild table
                 col_def_str = ', '.join(column_defs)
+                
+                # ✅ DEBUG: Log the actual CREATE TABLE SQL
+                create_table_sql = f"CREATE TABLE {quoted_temp} ({col_def_str})"
+                self.logger.info(f"🔥 DuckDB: About to execute CREATE TABLE:")
+                self.logger.info(f"   SQL: {create_table_sql}")
+                self.logger.info(f"   column_defs list: {column_defs}")
+                self.logger.info(f"   table_level_constraints: {table_level_constraints}")
 
                 # Create temp table with CHECK constraint
-                conn.execute(text(f"CREATE TABLE {quoted_temp} ({col_def_str})"))
+                conn.execute(text(create_table_sql))
 
                 # Copy data
                 if data_rows:
@@ -1705,19 +1723,38 @@ with engine.connect() as conn:
                             insert_sql = f"INSERT INTO {quoted_temp} ({quoted_cols}) VALUES ({placeholders})"
                             conn.execute(text(insert_sql), filtered_row)
 
-                # Drop old table using resolved reference
+                # Drop old table and rename temp
                 conn.execute(text(f"DROP TABLE {actual_table_reference}"))
-                # Rename temp to simple name (without schema prefix)
                 quoted_new = self._quote_identifier(table_name)
                 conn.execute(text(f"ALTER TABLE {quoted_temp} RENAME TO {quoted_new}"))
 
                 self.logger.info(f"✅ Successfully rebuilt table {table_name} with CHECK constraint")
+            
+                # ✅ CRITICAL: Commit if we created the connection
+                if should_close:
+                    conn.commit()
+                    self.logger.info(f"✅ Transaction committed")
+                    
+                    # ✅ WINDOWS FIX: Dispose engine to release ALL connections
+                    # This is critical on Windows which locks files with open connections
+                    try:
+                        self.engine.dispose()
+                        self.logger.debug(f"✅ Disposed engine to release database locks")
+                    except Exception as dispose_err:
+                        self.logger.warning(f"Failed to dispose engine: {dispose_err}")
                 
             finally:
                 if should_close:
                     conn.close()
             
         except Exception as e:
+            # Rollback on error
+            if 'should_close' in locals() and should_close and 'conn' in locals():
+                try:
+                    conn.rollback()
+                    self.logger.info(f"⚠️ Transaction rolled back due to error")
+                except:
+                    pass
             self.logger.error(f"Failed to create CHECK constraint: {e}")
             raise
 
@@ -1931,3 +1968,69 @@ with engine.connect() as conn:
             'changes': changes if changes else [f"Database analyzed for {normal_form} - no automated changes made"],
             'new_tables': new_tables
         }
+        
+    def get_table_indexes(self, table_name):
+        """
+        Get all non-primary key indexes for a table
+        Returns: List of dicts with 'name', 'columns', 'unique'
+        """
+        indexes = []
+        
+        with self.engine.connect() as conn:
+            # Get indexes using duckdb_indexes()
+            idx_result = conn.execute(text("""
+                SELECT 
+                    index_name,
+                    is_unique,
+                    sql
+                FROM duckdb_indexes()
+                WHERE table_name = :t
+            """), {'t': table_name}).fetchall()
+            
+            for idx_row in idx_result:
+                idx_name = idx_row[0]
+                is_unique = idx_row[1]
+                idx_sql = idx_row[2]
+                
+                # Skip primary key indexes
+                if 'PRIMARY KEY' in str(idx_sql).upper():
+                    continue
+                
+                # Extract column names from the SQL definition
+                # Pattern: CREATE [UNIQUE] INDEX ... ON table (col1, col2, ...)
+                import re
+                col_match = re.search(r'\((.*?)\)', str(idx_sql))
+                col_names = []
+                if col_match:
+                    cols_str = col_match.group(1)
+                    # Remove quotes and split by comma
+                    col_names = [c.strip().strip('"').strip('`') for c in cols_str.split(',')]
+                
+                if col_names:
+                    indexes.append({
+                        'name': idx_name,
+                        'columns': col_names,
+                        'unique': is_unique
+                    })
+        
+        return indexes
+
+    def create_index(self, table_name, index_name, columns, unique=False):
+        """
+        Create an index on a table
+        
+        Args:
+            table_name: Name of the table
+            index_name: Name of the index
+            columns: List of column names
+            unique: Whether the index should be unique
+        """
+        with self.engine.connect() as conn:
+            unique_str = "UNIQUE" if unique else ""
+            cols_str = ", ".join([self._quote_identifier(c) for c in columns])
+            quoted_table = self._quote_identifier(table_name)
+            quoted_idx = self._quote_identifier(index_name)
+            
+            create_idx_sql = f"CREATE {unique_str} INDEX {quoted_idx} ON {quoted_table} ({cols_str})"
+            conn.execute(text(create_idx_sql))
+            conn.commit()

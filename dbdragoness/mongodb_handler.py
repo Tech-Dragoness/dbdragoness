@@ -1592,9 +1592,18 @@ if docs:
             
             checks = []
             
-            for field_name, field_rules in properties.items():
+            # Get ALL fields (from properties OR required array)
+            all_fields = set(properties.keys()) | set(required_fields)
+            
+            for field_name in all_fields:
+                field_rules = properties.get(field_name, {})
+                
                 # Build human-readable constraint description
                 constraints = []
+                
+                # Required - CHECK THIS FIRST
+                if field_name in required_fields:
+                    constraints.append("required")
                 
                 # Type constraint
                 if 'bsonType' in field_rules:
@@ -1602,10 +1611,6 @@ if docs:
                     if isinstance(type_name, list):
                         type_name = ', '.join(type_name)
                     constraints.append(f"type: {type_name}")
-                
-                # Required
-                if field_name in required_fields:
-                    constraints.append("required")
                 
                 # Numeric constraints
                 if 'minimum' in field_rules:
