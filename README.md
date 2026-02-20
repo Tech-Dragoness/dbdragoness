@@ -1,13 +1,3 @@
-<p align="center">
-  <img src="assets/Logo.png" width="160" alt="DBDragoness Logo">
-</p>
-
-<h1 align="center">DBDragoness 🐉</h1>
-
-<p align="center">
-  A lightweight GUI manager for SQL & NoSQL databases
-</p>
-
 ## Features
 
 - 🎯 Support for multiple databases: SQLite, MySQL, PostgreSQL, DuckDB, TinyDB, MongoDB
@@ -24,7 +14,7 @@
 ```bash
 pip install --upgrade dbdragoness
 ```
-Note: Latest version is 0.1.16
+Note: Latest version is 0.1.17
 
 ### Development Setup (For Developers & Academic Use)
 

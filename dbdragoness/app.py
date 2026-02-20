@@ -1194,41 +1194,31 @@ def create_app(initial_db_type, handler_name=None):
             logger.error(f"❌ Failed to parse request: {e}")
             return jsonify({'success': False, 'error': 'Invalid request data'}), 400
         
+        # Validate inputs and check for name conflicts BEFORE starting the stream
+        if not all([source_db, target_db_name, target_type, target_handler]):
+            return jsonify({'success': False, 'error': 'Missing required parameters'}), 400
+        
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', target_db_name):
+            return jsonify({'success': False, 'error': 'Target database name must start with a letter, contain only letters, numbers, underscores.'}), 400
+        
+        current_handler = app.config['HANDLER']
+        current_type = app.config['DB_TYPE']
+        
         def generate():
             try:
                 logger.debug(f"✅ API call: POST /api/databases/convert")
                 logger.debug(f"   Source: {source_db}, Target: {target_db_name}, Type: {target_type}, Handler: {target_handler}")
                 
-                # Validate inputs
-                if not all([source_db, target_db_name, target_type, target_handler]):
-                    yield send_sse_message({'error': 'Missing required parameters'})
+                # Check if target DB already exists before doing anything
+                if target_type == 'sql':
+                    temp_handler = SQLHandler(target_handler)
+                else:
+                    temp_handler = NoSQLHandler(target_handler)
+                
+                if target_db_name in temp_handler.list_dbs():
+                    yield send_sse_message({'error': f"Database '{target_db_name}' already exists. Please choose a different name."})
                     return
-                
-                if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', target_db_name):
-                    yield send_sse_message({'error': 'Target database name must start with a letter, contain only letters, numbers, underscores.'})
-                    return
-                
-                # Check if target name already exists in BOTH SQL and NoSQL
-                current_handler = app.config['HANDLER']
-                current_type = app.config['DB_TYPE']
-                
-                # Check in current type
-                if target_db_name in current_handler.list_dbs():
-                    yield send_sse_message({'error': f'Database {target_db_name} already exists in current handler'})
-                    return
-                
-                # Check in target type if different
-                if target_type != current_type:
-                    # Temporarily switch to target handler to check
-                    if target_type == 'sql':
-                        temp_handler = SQLHandler(target_handler)
-                    else:
-                        temp_handler = NoSQLHandler(target_handler)
-                    
-                    if target_db_name in temp_handler.list_dbs():
-                        yield send_sse_message({'error': f'Database {target_db_name} already exists in target handler'})
-                        return
-                
+
                 # Step 1: Export from source database (JSON format)
                 logger.info(f"Step 1: Exporting {source_db} as JSON")
                 yield send_sse_message({'progress': 5, 'stage': 'export', 'message': 'Starting export...'})
@@ -1247,10 +1237,35 @@ def create_app(initial_db_type, handler_name=None):
                         'tables': []
                     }
                     
-                    tables = current_handler.list_tables()
+                    # Get views first so they can be excluded from table export
+                    export_data['views'] = []
+                    if hasattr(current_handler, 'list_views') and hasattr(current_handler, 'get_view_definition'):
+                        try:
+                            view_list = current_handler.list_views() or []
+                            for v in view_list:
+                                vname = v['name']
+                                try:
+                                    vdef = current_handler.get_view_definition(vname)
+                                    if vdef:
+                                        # Strip schema-qualified table references (e.g. schema.table -> table)
+                                        # MySQL stores view definitions with fully-qualified names
+                                        vdef = re.sub(r'\b\w+\.(\w+)\b', r'\1', vdef)
+                                        export_data['views'].append({
+                                            'name': vname,
+                                            'definition': vdef,
+                                            'is_full_statement': vdef.strip().upper().startswith('CREATE')
+                                        })
+                                except Exception as vdef_err:
+                                    logger.warning(f"⚠️ Could not get definition for view '{vname}': {vdef_err}")
+                            logger.info(f"Found {len(export_data['views'])} views in {source_db}")
+                        except Exception as ve:
+                            logger.warning(f"⚠️ Could not export views: {ve}")
+
+                    view_names = {v['name'] for v in export_data['views']}
+                    tables = [t for t in current_handler.list_tables() if t not in view_names]
                     total_tables = len(tables)
-                    
-                    if total_tables == 0:
+
+                    if total_tables == 0 and not export_data['views']:
                         yield send_sse_message({'error': 'Source database is empty'})
                         return
                     
@@ -1355,6 +1370,11 @@ def create_app(initial_db_type, handler_name=None):
                 logger.info(f"Step 2: Switching to target handler ({target_type}/{target_handler})")
                 yield send_sse_message({'progress': 55, 'stage': 'switch', 'message': 'Switching database handler...'})
                 
+                # Save original handler state so we can restore on failure
+                original_handler = app.config['HANDLER']
+                original_type = app.config['DB_TYPE']
+                original_handler_name = app.config['CURRENT_HANDLER_NAME']
+                
                 try:
                     # Switch handler
                     app.config['DB_TYPE'] = target_type
@@ -1376,6 +1396,9 @@ def create_app(initial_db_type, handler_name=None):
                     
                 except Exception as switch_error:
                     logger.error(f"Handler switch failed: {switch_error}")
+                    app.config['HANDLER'] = original_handler
+                    app.config['DB_TYPE'] = original_type
+                    app.config['CURRENT_HANDLER_NAME'] = original_handler_name
                     yield send_sse_message({'error': f'Failed to switch handler: {str(switch_error)}'})
                     return
                 
@@ -1871,6 +1894,31 @@ def create_app(initial_db_type, handler_name=None):
                             except Exception as proc_err:
                                 logger.warning(f"⚠️ Failed to import procedure {proc.get('name')}: {proc_err}")
                     
+                    # Import views (SQL targets only, after all tables exist)
+                    if target_type == 'sql':
+                        actual_handler = target_handler_obj.handler if hasattr(target_handler_obj, 'handler') else target_handler_obj
+                        if hasattr(actual_handler, 'create_view'):
+                            for view in export_data.get('views', []):
+                                try:
+                                    vdef = view['definition']
+                                    is_full = view.get('is_full_statement', False)
+                                    # create_view on SQLite/DuckDB (first method) expects full statement
+                                    # create_view on MySQL/PostgreSQL expects just the SELECT body
+                                    target_db_handler_name = actual_handler.DB_NAME if hasattr(actual_handler, 'DB_NAME') else 'SQLite'
+                                    if target_db_handler_name in ('SQLite', 'DuckDB'):
+                                        if not is_full:
+                                            vdef = f"CREATE VIEW {view['name']} AS {vdef}"
+                                    else:
+                                        if is_full:
+                                            # Strip down to just the SELECT body
+                                            match = re.search(r'\bAS\b\s+([\s\S]+)', vdef, re.IGNORECASE)
+                                            if match:
+                                                vdef = match.group(1).strip()
+                                    actual_handler.create_view(view['name'], vdef)
+                                    logger.info(f"✅ Imported view '{view['name']}'")
+                                except Exception as view_err:
+                                    logger.warning(f"⚠️ Failed to import view '{view['name']}': {view_err}")
+
                     yield send_sse_message({'progress': 100, 'stage': 'complete', 'target_db': target_db_name, 'message': 'Conversion complete!'})
                     logger.info(f"✅ Conversion complete: {source_db} -> {target_db_name}")
                     
@@ -1878,6 +1926,10 @@ def create_app(initial_db_type, handler_name=None):
                     logger.error(f"Import failed: {import_error}")
                     import traceback
                     logger.error(traceback.format_exc())
+                    # Restore original handler so the UI doesn't switch
+                    app.config['HANDLER'] = original_handler
+                    app.config['DB_TYPE'] = original_type
+                    app.config['CURRENT_HANDLER_NAME'] = original_handler_name
                     yield send_sse_message({'error': f'Import failed: {str(import_error)}'})
                     return
             
@@ -2338,10 +2390,16 @@ def create_app(initial_db_type, handler_name=None):
             page = request.args.get('page', 1, type=int)
             per_page = request.args.get('per_page', 10, type=int)
         
-            # Get all tables
+            # Get all tables, excluding views for SQL handlers
             all_tables = app.config['HANDLER'].list_tables()
         
             if app.config['DB_TYPE'] == 'sql':
+                if hasattr(app.config['HANDLER'], 'list_views'):
+                    try:
+                        view_names = {v['name'] for v in (app.config['HANDLER'].list_views() or [])}
+                        all_tables = [t for t in all_tables if t not in view_names]
+                    except Exception:
+                        pass
                 all_tables = sorted(all_tables)
                 total_items = len(all_tables)
                 total_pages = (total_items + per_page - 1) // per_page

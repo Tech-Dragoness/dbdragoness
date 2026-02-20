@@ -15,7 +15,8 @@
     "insert into table1 values (66, 12)",
     "insert into table1 values(66, 'Tulika')",
     "INSERT INTO trial1 (name) VALUES ('name');",
-    "select * from table2;"
+    "select * from table2;",
+    "select * from names;"
   ],
   "MySQL": [
     "SHOW CREATE TABLE table2",
@@ -63,7 +64,8 @@
     "CREATE TABLE orders (\n    id INT NOT NULL,\n    order_date DATE NOT NULL,\n    amount DECIMAL(10,2),\n    PRIMARY KEY (id, order_date)\n);",
     "use bookstore_db;\nselect * from cart;",
     "use bookstore_db;\nselect * from users;",
-    "use bookstore_db;\nselect * from users;\nSELECT * FROM orders;"
+    "use bookstore_db;\nselect * from users;\nSELECT * FROM orders;",
+    "select * from names;"
   ],
   "PostgreSQL": [
     "CREATE TABLE check_test (\n    id INT PRIMARY KEY,\n    age INT CHECK (age >= 18),\n    grade CHAR(1) CHECK (grade IN ('A', 'B', 'C'))\n);",
@@ -97,7 +99,8 @@
     "select * from simple_customers;",
     "CREATE TRIGGER order_details_insert\nINSTEAD OF INSERT ON order_details\nFOR EACH ROW\nEXECUTE FUNCTION insert_order_details();",
     "SELECT tgname\nFROM pg_trigger\nWHERE tgname = 'order_details_insert';",
-    "INSERT INTO order_details (\n    order_id,\n    customer,\n    product_name,\n    quantity,\n    price\n)\nVALUES (\n    104,\n    'Bob',\n    'Book',\n    2,\n    50.00\n);"
+    "INSERT INTO order_details (\n    order_id,\n    customer,\n    product_name,\n    quantity,\n    price\n)\nVALUES (\n    104,\n    'Bob',\n    'Book',\n    2,\n    50.00\n);",
+    "select * from names;"
   ],
   "SQLite": [
     "CREATE TABLE check_test (\n    id INTEGER PRIMARY KEY,\n    quantity INTEGER CHECK (quantity > 0),\n    status TEXT CHECK (status IN ('open', 'closed'))\n);",
@@ -106,7 +109,8 @@
     "DELETE FROM trial1;",
     "CREATE TABLE customers (\n    customer_id INT PRIMARY KEY,\n    name TEXT\n);\nCREATE TABLE orders (\n    order_id INT PRIMARY KEY,\n    customer_id INT,\n    order_date DATE,\n    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)\n);\nCREATE TABLE products (\n    product_id INT PRIMARY KEY,\n    product_name TEXT,\n    price DECIMAL(10,2)\n);\nCREATE TABLE order_items (\n    order_id INT,\n    product_id INT,\n    quantity INT,\n    PRIMARY KEY (order_id, product_id),\n    FOREIGN KEY (order_id) REFERENCES orders(order_id),\n    FOREIGN KEY (product_id) REFERENCES products(product_id)\n);\nINSERT INTO customers VALUES\n(1, 'Alice'),\n(2, 'Bob');\n\nINSERT INTO products VALUES\n(1, 'Pen', 10.00),\n(2, 'Book', 50.00);\n\nINSERT INTO orders VALUES\n(101, 1, '2024-01-10'),\n(102, 2, '2024-01-12');\n\nINSERT INTO order_items VALUES\n(101, 1, 2),\n(101, 2, 1),\n(102, 2, 3);",
     "SELECT * FROM order_details;",
-    "SELECT * FROM order_totals;"
+    "SELECT * FROM order_totals;",
+    "select * from names;"
   ],
   "MongoDB": [
     "use luxeBeautyDB;\ndb.products.find();",
