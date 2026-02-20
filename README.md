@@ -1,3 +1,13 @@
+<p align="center">
+  <img src="assets/Logo.png" width="160" alt="DBDragoness Logo">
+</p>
+
+<h1 align="center">DBDragoness 🐉</h1>
+
+<p align="center">
+  A lightweight GUI manager for SQL & NoSQL databases
+</p>
+
 ## Features
 
 - 🎯 Support for multiple databases: SQLite, MySQL, PostgreSQL, DuckDB, TinyDB, MongoDB
