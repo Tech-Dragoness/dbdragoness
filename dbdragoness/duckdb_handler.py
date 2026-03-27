@@ -149,13 +149,8 @@ else:
         self.logger.info(f"🔍 Creating file at: '{path}'")
         
         if self.engine:
-            try:
-                with self.engine.connect() as _ckpt_conn:
-                    _ckpt_conn.execute(text("CHECKPOINT"))
-            except Exception:
-                pass
             self.engine.dispose()
-        self.engine = create_engine(f"duckdb:///{path}")
+        self.engine = create_engine(f"duckdb:///{path}", poolclass=pool.NullPool)
         self.current_db = db_name
         
         with self.engine.connect() as conn:
@@ -220,13 +215,8 @@ else:
         
         path = self._get_db_path(actual_db_name)
         if self.engine:
-            try:
-                with self.engine.connect() as _ckpt_conn:
-                    _ckpt_conn.execute(text("CHECKPOINT"))
-            except Exception:
-                pass
             self.engine.dispose()
-        self.engine = create_engine(f"duckdb:///{path}")
+        self.engine = create_engine(f"duckdb:///{path}", poolclass=pool.NullPool)
         self.current_db = actual_db_name  # Use actual case from disk
     
     def _find_actual_db_name(self, db_name):
@@ -252,7 +242,7 @@ else:
         dbs = []
         for db_file in self.base_path.glob('*_duckdb.db'):
             # Extract the database name preserving case from filename
-            db_name = db_file.stem.replace('_duckdb', '')
+            db_name = db_file.name[:-len('_duckdb.db')]
             dbs.append(db_name)
         
         return dbs
@@ -281,7 +271,7 @@ else:
         path_obj = Path(path)
         if not path_obj.exists():
             return []
-        engine = create_engine(f"duckdb:///{path}")
+        engine = create_engine(f"duckdb:///{path}", poolclass=pool.NullPool)
         self.logger.error(f"🔍 LIST_TABLES_FOR_DB: opening fresh engine for '{db_name}' at {path}")
         with engine.connect() as conn:
             # Show every object and its type so we can see if views appear
@@ -358,11 +348,8 @@ else:
                     SELECT table_name FROM information_schema.tables 
                     WHERE table_schema = 'main'
                 """)).fetchall()
-                self.logger.error(f"🔍 DEBUG: All tables in DuckDB information_schema: {[t[0] for t in debug_tables]}")
             except Exception as e:
                 self.logger.error(f"🔍 DEBUG: Failed to list tables: {e}")
-
-            self.logger.error(f"🔍 DEBUG: Looking for table '{table_name}' in DuckDB")
 
             # DuckDB stores table names in information_schema - try case-insensitive match
             query = text("""
@@ -380,7 +367,6 @@ else:
                 ORDER BY ordinal_position
             """)
             result = conn.execute(query, {'table_name': table_name}).fetchall()
-            self.logger.error(f"🔍 DEBUG: Query with LOWER() returned {len(result)} rows")
 
             if not result:
                 # Try without LOWER - exact match
@@ -399,12 +385,10 @@ else:
                     ORDER BY ordinal_position
                 """)
                 result = conn.execute(query_exact, {'table_name': table_name}).fetchall()
-                self.logger.error(f"🔍 DEBUG: Query without LOWER() (exact '{table_name}') returned {len(result)} rows")
 
             if not result:
                 # Try lowercase explicitly
                 result = conn.execute(query_exact, {'table_name': table_name.lower()}).fetchall()
-                self.logger.error(f"🔍 DEBUG: Query with lowercase '{table_name.lower()}' returned {len(result)} rows")
 
             # Get PRIMARY KEY columns
             pk_query = text("""
@@ -761,7 +745,7 @@ else:
             except Exception:
                 pass
             path = self._get_db_path(self.current_db)
-            self.engine = create_engine(f"duckdb:///{path}")
+            self.engine = create_engine(f"duckdb:///{path}", poolclass=pool.NullPool)
 
         with self.engine.connect() as conn:
             try:
@@ -793,11 +777,16 @@ else:
                         for old_col_name in old_autoincrement_cols:
                             old_seq_name = f"{old_table_name}_{old_col_name}_seq"
                             quoted_old_seq = self._quote_identifier(old_seq_name)
+                            temp_engine = create_engine(f"duckdb:///{self._get_db_path(self.current_db)}")
                             try:
-                                conn.execute(text(f"DROP SEQUENCE IF EXISTS {quoted_old_seq} CASCADE"))
-                                self.logger.debug(f"Dropped old sequence {old_seq_name} CASCADE")
+                                with temp_engine.connect() as temp_conn:
+                                    temp_conn.execute(text(f"DROP SEQUENCE IF EXISTS {quoted_old_seq} CASCADE"))
+                                    temp_conn.commit()
+                                    self.logger.debug(f"Dropped old sequence {old_seq_name} CASCADE")
                             except Exception as drop_err:
                                 self.logger.warning(f"Could not drop old sequence {old_seq_name}: {drop_err}")
+                            finally:
+                                temp_engine.dispose()
 
                 except Exception as cleanup_err:
                     self.logger.warning(f"Sequence cleanup failed: {cleanup_err}")
@@ -815,14 +804,17 @@ else:
                         if has_autoincrement:
                             seq_name = f"{new_table_name}_{col_name}_seq"
                             quoted_seq = self._quote_identifier(seq_name)
-                            
-                            # Create sequence in separate connection
+                            temp_engine = create_engine(f"duckdb:///{self._get_db_path(self.current_db)}")
                             try:
-                                conn.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {quoted_seq} START 1"))
-                                self.logger.debug(f"Created sequence {seq_name}")
+                                with temp_engine.connect() as temp_conn:
+                                    temp_conn.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {quoted_seq} START 1"))
+                                    temp_conn.commit()
+                                    self.logger.debug(f"Created sequence {seq_name}")
                             except Exception as e:
                                 self.logger.error(f"Failed to create sequence {seq_name}: {e}")
                                 raise
+                            finally:
+                                temp_engine.dispose()
             
                 import re  # ✅ Import at top of try block — avoids Python unbound-local issue
                 composite_pk_cols = []  # Track columns in a table-level PK clause
@@ -1751,14 +1743,6 @@ with engine.connect() as conn:
                 
                 # Get schema using the resolved reference
                 schema = self.get_table_schema(table_name, conn=conn)
-                
-                # DIAGNOSTIC - REMOVE AFTER DEBUGGING
-                self.logger.error(f"DEBUG: Schema retrieved = {schema}")
-                self.logger.error(f"DEBUG: Schema length = {len(schema) if schema else 'None'}")
-                self.logger.error(f"DEBUG: Schema type = {type(schema)}")
-                if schema:
-                    self.logger.error(f"DEBUG: First column = {schema[0] if len(schema) > 0 else 'empty'}")
-                # END DIAGNOSTIC
                             
                 self.logger.debug(f"Retrieved schema for {table_name}: {schema}")
                 
