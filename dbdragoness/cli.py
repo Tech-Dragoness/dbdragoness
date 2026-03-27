@@ -114,6 +114,49 @@ def build_react_frontend():
         print("3. Restart terminal/VSCode")
         return False
 
+def _resolve_handler_name(handler_name, available_handlers):
+    """
+    Match handler_name to available_handlers case-insensitively.
+    If no exact case-insensitive match is found, suggest the closest
+    name and ask the user to confirm or fall back to the default.
+    Returns the correctly-cased handler name from the registry, or None
+    to signal 'use default'.
+    """
+    import difflib
+
+    # Case-insensitive exact match
+    for h in available_handlers:
+        if h.lower() == handler_name.lower():
+            return h
+
+    # No match — find the closest candidate
+    matches = difflib.get_close_matches(
+        handler_name.lower(),
+        [h.lower() for h in available_handlers],
+        n=1,
+        cutoff=0.5,
+    )
+
+    if matches:
+        # Map the lowercased match back to the real cased name
+        suggestion = next(h for h in available_handlers if h.lower() == matches[0])
+        answer = input(
+            f"Handler '{handler_name}' not found. Did you mean '{suggestion}'? "
+            f"[Y/n/Enter] "
+        ).strip().lower()
+        if answer in ('', 'y', 'yes'):
+            return suggestion
+        else:
+            click.echo(f"Using default handler instead.")
+            return None
+    else:
+        click.echo(
+            f"Handler '{handler_name}' not found and no close match exists. "
+            f"Using default handler instead."
+        )
+        return None
+
+
 @click.group(invoke_without_command=True)
 @click.pass_context
 @click.option('--type', 'db_type', type=click.Choice(['sql', 'nosql'], case_sensitive=False), 
@@ -122,31 +165,20 @@ def build_react_frontend():
 @click.option('--db', 'db_name', help='Database name to open or create')
 @click.option('--table', 'table_name', help='Table/collection name to open or create')
 @click.option('--port', default=8000, help='Port to run on (default: 8000)')
-@click.option('--no-react-build', is_flag=True, help='Skip React build (use existing build)')
-@click.option('--use-react', is_flag=True, help='Open React UI')
-def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, use_react):
+def cli(ctx, db_type, handler_name, db_name, table_name, port):
     """DBDragoness - Database GUI Manager
     
     Examples:
         dbdragoness                      # Interactive mode
         dbdragoness --type sql                    # Open SQL homepage
-        dbdragoness --type sql --handler     # Open directly into a DB
+        dbdragoness --type sql --handler SQLite   # Open directly into a DB
     """
     
     # If subcommand invoked, don't run main logic
     if ctx.invoked_subcommand is not None:
         return
     
-    # Build React frontend unless skipped
-    react_available = False
-    if not no_react_build:
-        react_available = ensure_react_built()  # ✅ Use new function
-    else:
-        # Check if React build exists at dbdragoness/static/react
-        react_build_dir = os.path.join(os.path.dirname(__file__), 'static', 'react')
-        react_available = os.path.exists(os.path.join(react_build_dir))
-        if react_available:
-            print("✓ Using existing React build")
+    react_available = ensure_react_built()
     
     # Discover handlers first
     DBRegistry.discover_handlers()
@@ -166,104 +198,119 @@ def cli(ctx, db_type, handler_name, db_name, table_name, port, no_react_build, u
                 type=click.Choice(['sql', 'nosql'], case_sensitive=False)
             ).lower()
     
+    # Normalise db_type (click's case_sensitive=False already lowercases it,
+    # but guard here in case it arrives mixed-case from a subcommand path)
+    if db_type:
+        db_type = db_type.lower()
+
     # Determine handler
-    if not handler_name:
-        if db_type == 'sql':
-            available = list(DBRegistry.get_sql_handlers().keys())
-        else:
-            available = list(DBRegistry.get_nosql_handlers().keys())
-        
-        if not available:
-            click.echo(f"Error: No {db_type.upper()} handlers available.", err=True)
-            sys.exit(1)
-        
-        handler_name = available[0]
-        click.echo(f"Using handler: {handler_name}")
-    
+    if db_type == 'sql':
+        available_handlers = list(DBRegistry.get_sql_handlers().keys())
+    else:
+        available_handlers = list(DBRegistry.get_nosql_handlers().keys())
+
+    if not available_handlers:
+        click.echo(f"Error: No {db_type.upper()} handlers available.", err=True)
+        sys.exit(1)
+
+    if handler_name:
+        # Resolve case-insensitively, with typo suggestion
+        resolved = _resolve_handler_name(handler_name, available_handlers)
+        handler_name = resolved if resolved else available_handlers[0]
+    else:
+        handler_name = available_handlers[0]
+
+    click.echo(f"Using handler: {handler_name}")
+
     # Find available port
     port = find_available_port(port)
-    
+
     # Create app with specified type and handler
     app = create_app(db_type, handler_name)
-    
-    # Determine target URL - DEFAULT TO REACT if available
+
+    # Default URL — always open to React home if available
     if react_available:
         target_url = f"http://localhost:{port}/react/"
         click.echo("🚀 Using React UI (default)")
-    
-    # Handle database and table operations (keeping existing logic)
+    else:
+        target_url = f"http://localhost:{port}/"
+
+    # Handle --db and --table: navigate directly to the right page
     if db_name:
         handler = app.config['HANDLER']
         existing_dbs = handler.list_dbs()
-        
+
         if db_name in existing_dbs:
             click.echo(f"✓ Database '{db_name}' exists")
-            
+
             if table_name:
                 try:
                     handler.switch_db(db_name)
                     existing_tables = handler.list_tables()
-                    
+
                     if table_name in existing_tables:
                         click.echo(f"✓ Table '{table_name}' exists")
                         if db_type == 'sql':
-                            if use_react and react_available:
-                                target_url = f"http://localhost:{port}/react/#/db/{db_name}/table/{table_name}"
+                            target_url = f"http://localhost:{port}/react/db/{db_name}/table/{table_name}"
                         else:
-                            if use_react and react_available:
-                                target_url = f"http://localhost:{port}/react/#/db/{db_name}/collection/{table_name}"
+                            target_url = f"http://localhost:{port}/react/db/{db_name}/collection/{table_name}"
                     else:
-                        click.echo(f"Creating table '{table_name}' in database '{db_name}'...")
-                        create_table_or_collection(handler, db_name, table_name, db_type)
-                        if db_type == 'sql':
-                            if use_react and react_available:
-                                target_url = f"http://localhost:{port}/react/#/db/{db_name}/table/{table_name}"
+                        click.echo(f"Table '{table_name}' does not exist in database '{db_name}'.")
+                        if click.confirm(f"Create table '{table_name}'?", default=True):
+                            create_table_or_collection(handler, db_name, table_name, db_type)
+                            if db_type == 'sql':
+                                target_url = f"http://localhost:{port}/react/db/{db_name}/table/{table_name}"
+                            else:
+                                target_url = f"http://localhost:{port}/react/db/{db_name}/collection/{table_name}"
                         else:
-                            if use_react and react_available:
-                                target_url = f"http://localhost:{port}/react/#/db/{db_name}/collection/{table_name}"
-                
+                            if click.confirm(f"Open database '{db_name}' instead?", default=True):
+                                target_url = f"http://localhost:{port}/react/db/{db_name}"
+                            else:
+                                if click.confirm("Open homepage instead?", default=True):
+                                    target_url = f"http://localhost:{port}/react/"
+                                else:
+                                    click.echo("Exiting...")
+                                    sys.exit(0)
+
                 except Exception as e:
                     click.echo(f"Error accessing database: {e}", err=True)
                     sys.exit(1)
             else:
-                if use_react and react_available:
-                    target_url = f"http://localhost:{port}/react/#/db/{db_name}"
+                # --db only: open the database details page
+                target_url = f"http://localhost:{port}/react/db/{db_name}"
+
         else:
             if click.confirm(f"Database '{db_name}' does not exist. Create it?", default=True):
                 click.echo(f"Creating database '{db_name}'...")
                 try:
                     handler.create_db(db_name)
                     click.echo(f"✓ Database '{db_name}' created")
-                    
+
                     if table_name:
                         click.echo(f"Creating table '{table_name}'...")
                         create_table_or_collection(handler, db_name, table_name, db_type)
                         if db_type == 'sql':
-                            if use_react and react_available:
-                                target_url = f"http://localhost:{port}/react/#/db/{db_name}/table/{table_name}"
+                            target_url = f"http://localhost:{port}/react/db/{db_name}/table/{table_name}"
                         else:
-                            if use_react and react_available:
-                                target_url = f"http://localhost:{port}/react/#/db/{db_name}/collection/{table_name}"
+                            target_url = f"http://localhost:{port}/react/db/{db_name}/collection/{table_name}"
                     else:
-                        if use_react and react_available:
-                            target_url = f"http://localhost:{port}/react/#/db/{db_name}"
-                
+                        target_url = f"http://localhost:{port}/react/db/{db_name}"
+
                 except Exception as e:
                     click.echo(f"Error creating database: {e}", err=True)
                     sys.exit(1)
             else:
                 if click.confirm("Open homepage instead?", default=True):
-                    if use_react and react_available:
-                        target_url = f"http://localhost:{port}/react/"
+                    target_url = f"http://localhost:{port}/react/"
                 else:
                     click.echo("Exiting...")
                     sys.exit(0)
-    
+
     def open_browser():
         webbrowser.open_new(target_url)
         click.echo(f"\n🚀 Opening {target_url}")
-    
-    threading.Timer(1, open_browser).start()
+
+    threading.Timer(2, open_browser).start()
     click.echo(f"Starting server on port {port}...")
     app.run(debug=True, port=port, use_reloader=False)
 

@@ -954,7 +954,19 @@ with engine.connect() as conn:
                 new_column_info = {}
 
                 # ✅ CRITICAL: Extract CHECK constraints properly
+                composite_pk_cols = []  # Track columns in a composite PK clause
+
                 for col_def in new_columns:
+                    # ── Handle table-level PRIMARY KEY (...) constraint ──
+                    stripped = col_def.strip()
+                    if re.match(r'^PRIMARY\s+KEY\s*\(', stripped, re.IGNORECASE):
+                        quoted_new_columns.append(stripped)
+                        pk_match = re.search(r'PRIMARY\s+KEY\s*\(([^)]+)\)', stripped, re.IGNORECASE)
+                        if pk_match:
+                            composite_pk_cols = [c.strip().strip('`"') for c in pk_match.group(1).split(',')]
+                        self.logger.info(f"Detected table-level PRIMARY KEY clause: {stripped}")
+                        continue
+
                     parts = col_def.split(maxsplit=1)
                     if len(parts) >= 2:
                         col_name = parts[0]
@@ -1047,10 +1059,11 @@ with engine.connect() as conn:
 
                         quoted_new_columns.append(quoted_col_def)
 
+                        col_is_in_composite_pk = col_name in composite_pk_cols
                         new_column_info[col_name] = {
                             'definition': rest,
-                            'has_pk': 'PRIMARY KEY' in rest_upper,
-                            'has_not_null': 'NOT NULL' in rest_upper,
+                            'has_pk': 'PRIMARY KEY' in rest_upper or col_is_in_composite_pk,
+                            'has_not_null': 'NOT NULL' in rest_upper or col_is_in_composite_pk,
                             'has_autoincrement': 'AUTO_INCREMENT' in rest_upper,
                             'has_unique': 'UNIQUE' in rest_upper,
                             'type': rest_without_check.split()[0] if rest_without_check else 'VARCHAR(255)',
@@ -1062,6 +1075,8 @@ with engine.connect() as conn:
                             'definition': 'VARCHAR(255)',
                             'has_pk': False,
                             'has_not_null': False,
+                            'has_autoincrement': False,
+                            'has_unique': False,
                             'type': 'VARCHAR(255)',
                             'check_constraint': None
                         }
@@ -1072,6 +1087,10 @@ with engine.connect() as conn:
                 # ✅ Validate column definitions for MySQL
                 for col_name, col_info in new_column_info.items():
                     if col_info.get('has_autoincrement', False):
+                        # A composite PK column cannot be AUTO_INCREMENT
+                        if col_name in composite_pk_cols:
+                            self.logger.error(f"Column {col_name} is part of composite PK and cannot have AUTO_INCREMENT")
+                            raise ValueError(f"AUTO_INCREMENT column '{col_name}' cannot be part of a composite PRIMARY KEY")
                         if not col_info['has_pk'] and not col_info['has_unique']:
                             self.logger.error(f"Column {col_name} has AUTO_INCREMENT but no PRIMARY KEY or UNIQUE")
                             raise ValueError(f"AUTO_INCREMENT column '{col_name}' must have PRIMARY KEY or UNIQUE constraint")
@@ -1254,12 +1273,19 @@ with engine.connect() as conn:
         END"""
         
         logger.debug(f"[TRIGGER IN TRANSACTION] SQL:\n{trigger_sql}")
-        
-        # Execute within provided transaction - NO COMMIT
-        conn.execute(text(trigger_sql))
-        
+
+        # MySQL DDL containing semicolons inside BEGIN...END cannot go through
+        # SQLAlchemy's text() — the driver splits on semicolons and breaks the DDL.
+        # Use the raw DBAPI cursor, exactly as create_trigger() does.
+        try:
+            raw_cursor = conn.connection.cursor()
+            raw_cursor.execute(trigger_sql)
+        except AttributeError:
+            # Fallback for SQLAlchemy versions with an extra connection wrapper
+            conn.connection.connection.cursor().execute(trigger_sql)
+
         logger.debug(f"[TRIGGER IN TRANSACTION] Created {trigger_name} (within transaction)")
-        # DO NOT COMMIT - let the caller handle it
+        # Note: MySQL DDL auto-commits at the engine level; no explicit commit needed here
 
     def list_triggers(self, table_name=None):
         """List triggers with proper result handling"""
@@ -1281,13 +1307,21 @@ with engine.connect() as conn:
                         WHERE TRIGGER_SCHEMA = DATABASE()
                     """))
             
-                return [{
-                    'name': r[0], 
-                    'table': r[1], 
-                    'sql': r[2], 
-                    'timing': r[3], 
-                    'event': r[4]
-                } for r in result]
+                rows = result.fetchall()
+                triggers = []
+                for r in rows:
+                    body = r[2] or ''
+                    body_match = re.search(r'\bBEGIN\b(.+?)(?:\bEND\b)', body, re.DOTALL | re.IGNORECASE)
+                    if body_match:
+                        body = body_match.group(1).strip()
+                    triggers.append({
+                        'name': r[0],
+                        'table': r[1],
+                        'sql': body,
+                        'timing': r[3],
+                        'event': r[4]
+                    })
+                return triggers
         except Exception as e:
             self.logger.error(f"Error listing triggers: {e}")
             return []
@@ -2029,24 +2063,44 @@ with engine.connect() as conn:
             self.logger.error(f"Failed to clear credentials: {e}")
             
     def build_column_definitions(self, schema, quote=True):
-        """Build column definition strings for table creation"""
+        """Build column definition strings for table creation.
+
+        Supports composite primary keys: when more than one column has pk=True,
+        inline PRIMARY KEY constraints are omitted and a table-level
+        PRIMARY KEY (...) clause is appended instead.
+        """
         columns_def = []
+
+        # Detect composite PK up front
+        pk_columns = [col for col in schema if col.get('pk')]
+        has_composite_pk = len(pk_columns) > 1
+
         for col in schema:
             col_name = self._quote_identifier(col['name']) if quote else col['name']
             col_type = col['type']
-            
+
             # Ensure VARCHAR has size specification
             if col_type.upper().startswith('VARCHAR'):
                 if '(' not in col_type:
                     col_type = 'VARCHAR(255)'
-            
+
+            # TEXT/MEDIUMTEXT/etc. cannot be part of a MySQL index/PK — convert to VARCHAR
+            if col.get('pk') and col_type.upper() in ['TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'TINYTEXT']:
+                col_type = 'VARCHAR(255)'
+                self.logger.info(f"Auto-converted TEXT PK column '{col['name']}' to VARCHAR(255) for MySQL compatibility")
+
             col_def = f"{col_name} {col_type}"
-            
+
             if col.get('pk'):
-                if col.get('autoincrement'):
-                    col_def += " AUTO_INCREMENT PRIMARY KEY"
+                if not has_composite_pk:
+                    # Single PK — inline
+                    if col.get('autoincrement'):
+                        col_def += " AUTO_INCREMENT PRIMARY KEY"
+                    else:
+                        col_def += " PRIMARY KEY"
                 else:
-                    col_def += " PRIMARY KEY"
+                    # Part of composite PK — only NOT NULL inline; table-level clause added below
+                    col_def += " NOT NULL"
             else:
                 if col.get('autoincrement'):
                     col_def += " AUTO_INCREMENT UNIQUE NOT NULL"
@@ -2054,11 +2108,10 @@ with engine.connect() as conn:
                     col_def += " NOT NULL"
                 if col.get('unique') and not col.get('autoincrement'):
                     col_def += " UNIQUE"
-            
+
             # ✅ ADD CHECK CONSTRAINT
             if col.get('check_constraint'):
                 check_expr = col['check_constraint']
-                # Ensure column reference uses backticks for MySQL
                 check_with_backticks = re.sub(
                     r'\b' + re.escape(col['name']) + r'\b',
                     f'`{col["name"]}`',
@@ -2068,7 +2121,13 @@ with engine.connect() as conn:
                 self.logger.debug(f"Added CHECK constraint: {col['name']} CHECK ({check_with_backticks})")
 
             columns_def.append(col_def)
-        
+
+        # Append composite PRIMARY KEY table-level constraint
+        if has_composite_pk:
+            pk_col_names = [self._quote_identifier(col['name']) for col in pk_columns]
+            columns_def.append(f"PRIMARY KEY ({', '.join(pk_col_names)})")
+            self.logger.debug(f"Added composite PK clause: PRIMARY KEY ({', '.join(pk_col_names)})")
+
         return columns_def
     
     def build_column_definition_for_create(self, quoted_name, type_with_length, is_pk, is_not_null, is_autoincrement, is_unique, table_name=None, has_composite_pk=False):
@@ -2387,6 +2446,10 @@ with engine.connect() as conn:
         check_constraints_to_apply = []
         columns_def = []
         
+        # Detect composite PK
+        pk_columns_list = [col for col in schema if col.get('pk')]
+        has_composite_pk = len(pk_columns_list) > 1
+
         for col in schema:
             # Save CHECK constraint if present
             if col.get('check_constraint'):
@@ -2394,7 +2457,7 @@ with engine.connect() as conn:
                     'column': col['name'],
                     'expression': col['check_constraint']
                 })
-            
+
             # Build column definition WITHOUT CHECK constraint
             col_name = self._quote_identifier(col['name'])
             col_type = col['type'].upper()  # Make it uppercase for easy matching
@@ -2420,12 +2483,16 @@ with engine.connect() as conn:
             # ======================================
             
             col_def = f"{col_name} {col_type}"
-            
+
             if col.get('pk'):
-                if col.get('autoincrement'):
-                    col_def += " AUTO_INCREMENT PRIMARY KEY"
+                if not has_composite_pk:
+                    if col.get('autoincrement'):
+                        col_def += " AUTO_INCREMENT PRIMARY KEY"
+                    else:
+                        col_def += " PRIMARY KEY"
                 else:
-                    col_def += " PRIMARY KEY"
+                    # Composite PK member — only NOT NULL inline
+                    col_def += " NOT NULL"
             else:
                 if col.get('autoincrement'):
                     col_def += " AUTO_INCREMENT UNIQUE NOT NULL"
@@ -2433,12 +2500,18 @@ with engine.connect() as conn:
                     col_def += " NOT NULL"
                 if col.get('unique') and not col.get('autoincrement'):
                     col_def += " UNIQUE"
-            
+
             # ✅ DO NOT ADD CHECK CONSTRAINT HERE
             columns_def.append(col_def)
-        
+
+        # Append composite PK table-level constraint
+        if has_composite_pk:
+            pk_col_names = [self._quote_identifier(col['name']) for col in schema if col.get('pk')]
+            columns_def.append(f"PRIMARY KEY ({', '.join(pk_col_names)})")
+            self.logger.debug(f"copy_table: Added composite PK clause for {dest_table}")
+
         self.logger.debug(f"Found {len(check_constraints_to_apply)} CHECK constraints to apply after data copy")
-        
+
         # ✅ STEP 2: Create table WITHOUT CHECK constraints
         col_def_str = ', '.join(columns_def)
         quoted_dest = self._quote_identifier(dest_table)
@@ -2796,11 +2869,13 @@ with engine.connect() as conn:
                     SELECT 
                         PARTITION_NAME as name,
                         PARTITION_METHOD as type,
-                        PARTITION_EXPRESSION as expression
+                        PARTITION_EXPRESSION as expression,
+                        PARTITION_DESCRIPTION as boundary
                     FROM information_schema.PARTITIONS
                     WHERE TABLE_SCHEMA = DATABASE() 
                         AND TABLE_NAME = :table_name
                         AND PARTITION_NAME IS NOT NULL
+                    ORDER BY PARTITION_ORDINAL_POSITION
                 """), {'table_name': table_name})
                 
             elif self.DB_NAME == 'PostgreSQL':
@@ -2816,112 +2891,186 @@ with engine.connect() as conn:
                 """), {'table_name': table_name})
             
             return [dict(row._mapping) for row in result.fetchall()]
-        
-    def _get_column_type(self, table_name, column_name):
-        """Get the data type of a column"""
-        try:
-            schema = self.get_table_schema(table_name)
-            for col in schema:
-                if col['name'] == column_name:
-                    return col.get('type', '')
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get column type: {e}")
-            return None
 
+    def get_child_partition_tables(self):
+        """
+        MySQL partitions are not separate tables — return empty set.
+        This method exists so app.py can call it uniformly on any handler.
+        """
+        return set()
+        
     def create_partition(self, table_name, partition_config):
         """Create a partition on a table"""
         if not self.supports_partitions():
             raise NotImplementedError("Partitions not supported")
-        
+
         partition_type = partition_config.get('type', 'RANGE').upper()
         column = partition_config.get('column')
         definitions = partition_config.get('definitions', [])
-        
+
         if not column:
             raise ValueError("Partition column is required")
-        
-        # HASH partitions don't require definitions (just partition count)
+
         if partition_type != 'HASH' and not definitions:
             raise ValueError("Partition definitions are required for RANGE and LIST partitions")
-        
-        with self._get_connection() as conn:
+
+        # MySQL DDL (ALTER TABLE) is implicitly committed by the server and
+        # cannot run inside a SQLAlchemy-managed transaction. Build a dedicated
+        # autocommit engine so no transaction wrapper is created at all.
+        from urllib.parse import quote_plus
+        encoded_password = quote_plus(self.password if self.password else '')
+        autocommit_engine = create_engine(
+            f"mysql+pymysql://{self.username}:{encoded_password}"
+            f"@{self.host}:{self.port}/{self.current_db}?charset=utf8mb4",
+            poolclass=pool.NullPool,
+            execution_options={"isolation_level": "AUTOCOMMIT"}
+        )
+
+        conn = autocommit_engine.connect()
+        try:
             quoted_table = self._quote_identifier(table_name)
             quoted_column = self._quote_identifier(column)
-            
+
+            # MySQL requires the partition column to be part of the PRIMARY KEY.
+            # If it isn't, expand the PK to include it.
+            pk_result = conn.execute(text("""
+                SELECT COLUMN_NAME
+                FROM information_schema.KEY_COLUMN_USAGE
+                WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = :t
+                AND CONSTRAINT_NAME = 'PRIMARY'
+            """), {'t': table_name})
+            pk_cols = [row[0] for row in pk_result]
+            self.logger.info(f"[PARTITION] PK columns found: {pk_cols}")
+            self.logger.info(f"[PARTITION] Partition column: {column}")
+
+            if pk_cols and column not in pk_cols:
+                self.logger.info(f"[PARTITION] Expanding PK to include '{column}'")
+                all_pk_cols = ', '.join(
+                    self._quote_identifier(c) for c in pk_cols + [column]
+                )
+                self.logger.info(f"[PARTITION] New PK will be: {all_pk_cols}")
+
+                # Find any AUTO_INCREMENT columns in the current PK — MySQL
+                # forbids DROP PRIMARY KEY while AUTO_INCREMENT is on a column,
+                # so we must remove AUTO_INCREMENT first, drop the PK, recreate
+                # the composite PK, then restore AUTO_INCREMENT.
+                ai_result = conn.execute(text("""
+                    SELECT COLUMN_NAME, COLUMN_TYPE
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = :t
+                    AND EXTRA LIKE '%auto_increment%'
+                """), {'t': table_name})
+                ai_cols = [(row[0], row[1]) for row in ai_result]
+                self.logger.info(f"[PARTITION] AUTO_INCREMENT columns: {ai_cols}")
+
+                # Step 1: Strip AUTO_INCREMENT from each affected column
+                for ai_col_name, ai_col_type in ai_cols:
+                    quoted_ai_col = self._quote_identifier(ai_col_name)
+                    conn.execute(text(
+                        f"ALTER TABLE {quoted_table} "
+                        f"MODIFY COLUMN {quoted_ai_col} {ai_col_type} NOT NULL"
+                    ))
+                    self.logger.info(f"[PARTITION] Removed AUTO_INCREMENT from '{ai_col_name}'")
+
+                # Step 2: Drop the old PRIMARY KEY
+                conn.execute(text(f"ALTER TABLE {quoted_table} DROP PRIMARY KEY"))
+                self.logger.info(f"[PARTITION] Dropped old PK")
+
+                # Step 3: Add the new composite PRIMARY KEY
+                conn.execute(text(
+                    f"ALTER TABLE {quoted_table} ADD PRIMARY KEY ({all_pk_cols})"
+                ))
+                self.logger.info(f"[PARTITION] Added new composite PK")
+
+                # Step 4: Restore AUTO_INCREMENT on the original columns
+                for ai_col_name, ai_col_type in ai_cols:
+                    quoted_ai_col = self._quote_identifier(ai_col_name)
+                    conn.execute(text(
+                        f"ALTER TABLE {quoted_table} "
+                        f"MODIFY COLUMN {quoted_ai_col} {ai_col_type} NOT NULL AUTO_INCREMENT"
+                    ))
+                    self.logger.info(f"[PARTITION] Restored AUTO_INCREMENT on '{ai_col_name}'")
+            else:
+                self.logger.info(f"[PARTITION] PK already includes partition column or no PK exists, skipping expansion")
+
             partition_defs = []
-            
+
             if partition_type == 'RANGE':
-                # MySQL requires INTEGER expression for RANGE
-                # Auto-detect if column is DATE/DATETIME and wrap with YEAR()
-                col_type = self._get_column_type(table_name, column)
-                
-                if col_type and any(dt in col_type.upper() for dt in ['DATE', 'DATETIME', 'TIMESTAMP']):
-                    # Date column - use YEAR() function
+                try:
+                    schema = self.get_table_schema(table_name)
+                    col_type = next(
+                        (c.get('type', '') for c in schema if c['name'] == column), ''
+                    )
+                except Exception:
+                    col_type = ''
+                if col_type and any(
+                    dt in col_type.upper() for dt in ['DATE', 'DATETIME', 'TIMESTAMP']
+                ):
                     partition_expr = f"YEAR({quoted_column})"
                 else:
-                    # Numeric column - use directly
                     partition_expr = quoted_column
-                
+
                 for part_def in definitions:
                     name = part_def['name']
-                    value = part_def['value']
-                    partition_defs.append(f"PARTITION {name} VALUES LESS THAN ({value})")
-            
+                    value = part_def['value'].strip()
+                    if ',' in value:
+                        raise ValueError(
+                            f"RANGE partitioning requires a single boundary value per "
+                            f"partition (e.g. 50000 or MAXVALUE), but got: '{value}'. "
+                            f"To group multiple discrete values use LIST partitioning."
+                        )
+                    partition_defs.append(
+                        f"PARTITION {name} VALUES LESS THAN ({value})"
+                    )
+
+                conn.execute(text(
+                    f"ALTER TABLE {quoted_table} "
+                    f"PARTITION BY RANGE({partition_expr}) "
+                    f"({', '.join(partition_defs)})"
+                ))
+
             elif partition_type == 'LIST':
-                # MySQL LIST partitions require INTEGER values
-                # Check if column is numeric or string
-                col_type = self._get_column_type(table_name, column)
-                partition_expr = quoted_column
-                
                 for part_def in definitions:
                     name = part_def['name']
                     value = part_def['value']
-                    
-                    # Parse comma-separated values
                     values = [v.strip().strip("'\"") for v in value.split(',')]
-                    
-                    # Check if values are numeric
                     try:
-                        # Try to convert first value to int
                         int(values[0])
-                        # Numeric values - don't quote
                         quoted_values = ', '.join(values)
                     except (ValueError, IndexError):
-                        # String values - MySQL doesn't support this for LIST
-                        # Convert to numeric mapping or raise error
                         raise ValueError(
                             f"MySQL LIST partitioning requires INTEGER values. "
                             f"For string values like '{value}', consider using:\n"
                             f"1. HASH partitioning instead, or\n"
-                            f"2. Create a mapping column (e.g., region_id: North=1, South=2, etc.)"
+                            f"2. A numeric mapping column (North=1, South=2, etc.)"
                         )
-                    
-                    partition_defs.append(f"PARTITION {name} VALUES IN ({quoted_values})")
-            
+                    partition_defs.append(
+                        f"PARTITION {name} VALUES IN ({quoted_values})"
+                    )
+
+                conn.execute(text(
+                    f"ALTER TABLE {quoted_table} "
+                    f"PARTITION BY LIST({quoted_column}) "
+                    f"({', '.join(partition_defs)})"
+                ))
+
             elif partition_type == 'HASH':
-                # HASH partitions - use partition count
-                partition_expr = quoted_column
-                
-                # If definitions provided, use their count; otherwise default to 4
                 partition_count = len(definitions) if definitions else 4
-                
-                for i in range(partition_count):
-                    if definitions and i < len(definitions):
-                        name = definitions[i]['name']
-                    else:
-                        name = f"p{i}"
-                    partition_defs.append(f"PARTITION {name}")
-            
-            alter_sql = f"""
-                ALTER TABLE {quoted_table}
-                PARTITION BY {partition_type}({partition_expr})
-                ({', '.join(partition_defs)})
-            """
-            
-            conn.execute(text(alter_sql))
-            conn.commit()
-        
+                conn.execute(text(
+                    f"ALTER TABLE {quoted_table} "
+                    f"PARTITION BY HASH({quoted_column}) "
+                    f"PARTITIONS {partition_count}"
+                ))
+
+            else:
+                raise ValueError(f"Unsupported partition type: {partition_type}")
+
+        finally:
+            conn.close()
+            autocommit_engine.dispose()
+
         return True
 
     def drop_partition(self, table_name, partition_name):
@@ -3097,8 +3246,11 @@ with engine.connect() as conn:
                 # Handle primary key
                 if is_primary and not has_composite_pk:
                     col_def += " PRIMARY KEY"
-                
-                # Handle NOT NULL
+                elif is_primary and has_composite_pk:
+                    # Composite PK member — add NOT NULL inline
+                    col_def += " NOT NULL"
+
+                # Handle NOT NULL for non-PK columns
                 if not col.get('nullable', True) and not is_primary:
                     col_def += " NOT NULL"
                 
@@ -3145,3 +3297,40 @@ with engine.connect() as conn:
         finally:
             if should_close:
                 conn.close()
+                
+    def get_partition_info(self, table_name):
+        """
+        Return partition metadata for a table so it can be preserved
+        during export, import, and database conversion.
+        Returns None if the table is not partitioned.
+        """
+        try:
+            with self._get_connection() as conn:
+                result = conn.execute(text("""
+                    SELECT PARTITION_METHOD, PARTITION_EXPRESSION
+                    FROM information_schema.PARTITIONS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = :t
+                    AND PARTITION_NAME IS NOT NULL
+                    LIMIT 1
+                """), {'t': table_name})
+                row = result.fetchone()
+                if not row:
+                    return None
+
+                partition_type = row[0]
+                partition_expr = row[1]
+                # Strip YEAR() wrapper if present — store the raw column name
+                col_match = re.search(r'YEAR\((.+?)\)', partition_expr, re.IGNORECASE)
+                column = col_match.group(1).strip('`') if col_match else partition_expr.strip('`')
+
+                partitions = self.list_partitions(table_name)
+
+                return {
+                    'type': partition_type,
+                    'column': column,
+                    'partitions': partitions
+                }
+        except Exception as e:
+            self.logger.error(f"get_partition_info failed for {table_name}: {e}")
+            return None

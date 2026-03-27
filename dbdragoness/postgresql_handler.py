@@ -982,8 +982,23 @@ with engine.connect() as conn:
                 # === STEP 1: Parse new column definitions ===
                 quoted_new_columns = []
                 new_column_info = {}
+                composite_pk_cols = []  # Track columns that belong to a composite PK
 
                 for col_def in new_columns:
+                    # ── Handle table-level PRIMARY KEY (...) constraint ──
+                    # These arrive when the frontend/modify_table sends a composite PK clause
+                    # e.g. "PRIMARY KEY (col1, col2)"
+                    stripped = col_def.strip()
+                    if re.match(r'^PRIMARY\s+KEY\s*\(', stripped, re.IGNORECASE):
+                        # Keep as-is; will be appended after column defs
+                        quoted_new_columns.append(stripped)
+                        # Parse the column names out so we can mark them as PK below
+                        pk_match = re.search(r'PRIMARY\s+KEY\s*\(([^)]+)\)', stripped, re.IGNORECASE)
+                        if pk_match:
+                            composite_pk_cols = [c.strip().strip('"') for c in pk_match.group(1).split(',')]
+                        self.logger.info(f"Detected table-level PRIMARY KEY clause: {stripped}")
+                        continue
+
                     parts = col_def.split(maxsplit=1)
                     if len(parts) >= 2:
                         col_name = parts[0]
@@ -997,7 +1012,6 @@ with engine.connect() as conn:
                         check_constraint = None
                         rest_without_check = rest
                         if 'CHECK' in rest_upper:
-                            import re
                             check_match = re.search(r'CHECK\s*\((.+?)\)\s*$', rest, re.IGNORECASE | re.DOTALL)
                             if check_match:
                                 raw_check = check_match.group(1).strip()
@@ -1152,11 +1166,62 @@ with engine.connect() as conn:
             
                 # === STEP 5: Replace old table with new ===
                 quoted_old = self._quote_identifier(old_table_name)
-                conn.execute(text(f"DROP TABLE {quoted_old} CASCADE"))
-            
                 quoted_new = self._quote_identifier(new_table_name)
+
+                # Drop inbound FK constraints from OTHER tables that reference old_table_name,
+                # then recreate them after the rename so they point at new_table_name.
+                inbound_fks = []
+                try:
+                    fk_result = conn.execute(text("""
+                        SELECT
+                            tc.table_name        AS src_table,
+                            tc.constraint_name   AS constraint_name,
+                            kcu.column_name      AS src_col,
+                            ccu.column_name      AS ref_col,
+                            rc.update_rule,
+                            rc.delete_rule
+                        FROM information_schema.table_constraints AS tc
+                        JOIN information_schema.key_column_usage AS kcu
+                            ON tc.constraint_name = kcu.constraint_name
+                            AND tc.table_schema = kcu.table_schema
+                        JOIN information_schema.constraint_column_usage AS ccu
+                            ON ccu.constraint_name = tc.constraint_name
+                            AND ccu.table_schema = tc.table_schema
+                        JOIN information_schema.referential_constraints AS rc
+                            ON tc.constraint_name = rc.constraint_name
+                        WHERE tc.constraint_type = 'FOREIGN KEY'
+                          AND ccu.table_name = :ref_table
+                          AND tc.table_name  != :ref_table
+                    """), {'ref_table': old_table_name})
+                    inbound_fks = fk_result.fetchall()
+                except Exception as fk_err:
+                    self.logger.warning(f"Could not query inbound FKs: {fk_err}")
+
+                for fk in inbound_fks:
+                    src_table, constraint_name, _, _, _, _ = fk
+                    quoted_src = self._quote_identifier(src_table)
+                    self.logger.info(f"Dropping inbound FK {constraint_name} on {src_table}")
+                    conn.execute(text(f"ALTER TABLE {quoted_src} DROP CONSTRAINT IF EXISTS {constraint_name}"))
+
+                conn.execute(text(f"DROP TABLE {quoted_old}"))
+
                 conn.execute(text(f"ALTER TABLE {quoted_temp} RENAME TO {quoted_new}"))
-            
+
+                # Recreate inbound FKs now pointing at new_table_name
+                for fk in inbound_fks:
+                    src_table, constraint_name, src_col, ref_col, on_update, on_delete = fk
+                    quoted_src = self._quote_identifier(src_table)
+                    quoted_src_col = self._quote_identifier(src_col)
+                    quoted_ref_col = self._quote_identifier(ref_col)
+                    self.logger.info(f"Recreating inbound FK {constraint_name} on {src_table} -> {new_table_name}")
+                    conn.execute(text(f"""
+                        ALTER TABLE {quoted_src}
+                        ADD CONSTRAINT {constraint_name}
+                        FOREIGN KEY ({quoted_src_col})
+                        REFERENCES {quoted_new}({quoted_ref_col})
+                        ON UPDATE {on_update} ON DELETE {on_delete}
+                    """))
+
                 conn.commit()
                 self.logger.info(f"✓ Table modification completed successfully")
             
@@ -1286,40 +1351,50 @@ CREATE TRIGGER {q_trigger}
         quoted_trigger = self._quote_identifier(trigger_name)
         logger.debug(f"Quoted table: {quoted_table}, Quoted trigger: {quoted_trigger}")
         
+        # Sanitize: strip MySQL "CREATE TRIGGER ... FOR EACH ROW BEGIN ... END" wrapper
+        import re as _re
+        create_trig_match = _re.search(
+            r'\bCREATE\s+TRIGGER\b.+?\bFOR\s+EACH\s+ROW\b\s*\bBEGIN\b(.+)\bEND\b\s*;?\s*$',
+            body,
+            _re.DOTALL | _re.IGNORECASE
+        )
+        if create_trig_match:
+            body = create_trig_match.group(1).strip()
+        elif _re.match(r'^\s*BEGIN\b', body, _re.IGNORECASE):
+            # Strip any leftover BEGIN...END wrapper
+            inner = _re.search(r'\bBEGIN\b(.+)\bEND\b', body, _re.DOTALL | _re.IGNORECASE)
+            if inner:
+                body = inner.group(1).strip()
+
+        # Strip any stray RETURN NEW/OLD (will be added below if missing)
+        body = _re.sub(r'\bRETURN\s+(NEW|OLD)\s*;?\s*$', '', body, flags=_re.IGNORECASE).strip()
+
         # Build PL/pgSQL function body
         has_return = 'RETURN' in body.upper()
         logger.debug(f"Body has RETURN statement: {has_return}")
-        
+
         if not has_return:
-            plpgsql_body = f"BEGIN\n    {body}\nRETURN NEW;\nEND;"
+            return_stmt = "RETURN OLD;" if event.upper() == 'DELETE' else "RETURN NEW;"
+            plpgsql_body = f"BEGIN\n    {body}\n    {return_stmt}\nEND;"
         else:
             plpgsql_body = f"BEGIN\n    {body}\nEND;"
         
         logger.debug(f"Final PL/pgSQL function body:\n{plpgsql_body}")
         
-        # Build complete SQL (multi-statement)
-        trigger_sql = f"""DROP TRIGGER IF EXISTS {quoted_trigger} ON {quoted_table};
-    DROP FUNCTION IF EXISTS {func_name}() CASCADE;
-    CREATE OR REPLACE FUNCTION {func_name}()
-    RETURNS TRIGGER AS $$
-    {plpgsql_body}
-    $$ LANGUAGE plpgsql;;
-    CREATE TRIGGER {quoted_trigger}
-        {timing.upper()} {event.upper()} ON {quoted_table}
-        FOR EACH ROW
-        EXECUTE FUNCTION {func_name}();;"""
-        
-        logger.info(f"EXECUTING TRIGGER CREATION SQL:\n{trigger_sql}")
-        
-        # Execute within provided transaction - NO COMMIT
-        parts = [p.strip() for p in trigger_sql.split(';;') if p.strip()]
-        
-        for part in parts:
-            if not part or part == '$function$':
-                continue
+        sql_parts = [
+            f"DROP TRIGGER IF EXISTS {quoted_trigger} ON {quoted_table}",
+            f"DROP FUNCTION IF EXISTS {func_name}() CASCADE",
+            f"CREATE OR REPLACE FUNCTION {func_name}()\nRETURNS TRIGGER AS $$\n{plpgsql_body}\n$$ LANGUAGE plpgsql",
+            f"CREATE TRIGGER {quoted_trigger}\n    {timing.upper()} {event.upper()} ON {quoted_table}\n    FOR EACH ROW\n    EXECUTE FUNCTION {func_name}()",
+        ]
+
+        logger.info(f"EXECUTING TRIGGER CREATION SQL (parts):\n" + ";\n".join(sql_parts) + ";")
+
+        # Execute each statement individually within the provided transaction - NO COMMIT
+        for part in sql_parts:
             logger.debug(f"Executing part: {part}")
             conn.execute(text(part))
-        
+
         logger.info(f"✅ All trigger SQL parts executed successfully (within transaction)")
         # DO NOT COMMIT - let the caller handle it
 
@@ -1371,11 +1446,19 @@ CREATE TRIGGER {q_trigger}
                     else:
                         trigger_body = action_statement
                     
+                    # Strip outer BEGIN...END wrapper and RETURN NEW/OLD so the
+                    # body is portable to MySQL and SQLite without double-wrapping
+                    import re as _re
+                    body_match = _re.search(r'\bBEGIN\b(.+?)(?:\bEND\b)', trigger_body, _re.DOTALL | _re.IGNORECASE)
+                    if body_match:
+                        trigger_body = body_match.group(1).strip()
+                    trigger_body = _re.sub(r'\bRETURN\s+(NEW|OLD)\s*;?', '', trigger_body, flags=_re.IGNORECASE).strip()
+
                     triggers.append({
-                        'name': r[0], 
-                        'table': r[1], 
-                        'sql': trigger_body,  # ✅ Actual body, not EXECUTE statement
-                        'timing': r[3], 
+                        'name': r[0],
+                        'table': r[1],
+                        'sql': trigger_body,  # clean inner body, portable across DBs
+                        'timing': r[3],
                         'event': r[4]
                     })
             
@@ -1947,81 +2030,62 @@ $$ LANGUAGE plpgsql;
 SELECT update_marks(1, 95);"""
 
     def execute_plsql(self, plsql_code: str):
-        import logging
-    
         code = plsql_code.strip()
         if not code:
             return {"status": "No spell cast.", "notices": [], "refresh": False}
 
-        # ✅ FIX: Detect if this is a CREATE FUNCTION/PROCEDURE or just PL/pgSQL code
         code_upper = code.upper()
-        
-        # Check if it's a function/procedure creation or a CALL statement
+
         is_create_function = 'CREATE' in code_upper and ('FUNCTION' in code_upper or 'PROCEDURE' in code_upper)
         is_select_from_function = 'SELECT' in code_upper and 'FROM' in code_upper
         is_call = code_upper.startswith('CALL')
-        
-        # If it's CREATE FUNCTION/PROCEDURE or SELECT FROM function, execute directly
+
         if is_create_function or is_select_from_function or is_call:
             sql = code
             if not sql.rstrip().endswith(';'):
                 sql += ';'
-        # If it's already a DO block, use as-is
         elif code.upper().startswith('DO') and '$$' in code:
             sql = code
             if not sql.rstrip().endswith(';'):
                 sql += ';'
-        # Otherwise, wrap in DO block
         else:
             body = code
             if not body.upper().startswith('BEGIN'):
                 body = f"BEGIN\n    {body}\nEND;"
             sql = f"DO $$\n{body}\n$$;"
 
-        # Collect notices
-        notices = []
-        class NoticeCollector(logging.Handler):
-            def emit(self, record):
-                if 'NOTICE:' in record.getMessage():
-                    notices.append(record.getMessage().strip())
-
-        pg_logger = logging.getLogger('sqlalchemy.dialects.postgresql')
-        original_level = pg_logger.level
-        pg_logger.setLevel(logging.DEBUG)
-    
-        temp_handler = NoticeCollector()
-        pg_logger.addHandler(temp_handler)
-
         try:
-            with self.engine.connect() as conn:
-                # ✅ Execute with proper transaction handling
-                if is_create_function:
-                    # CREATE FUNCTION needs to be in its own transaction
-                    conn.execute(text("COMMIT"))  # End any existing transaction
-                    conn.execute(text(sql))
-                    conn.execute(text("COMMIT"))
-                else:
-                    conn.execute(text(sql))
-                    conn.commit()
+            # raw_connection() gives the actual psycopg2 connection from the pool
+            raw_conn = self.engine.raw_connection()
+            try:
+                # Clear any stale notices from previous executions on this pooled connection
+                raw_conn.notices.clear()
 
-            pg_logger.removeHandler(temp_handler)
-            pg_logger.setLevel(original_level)
+                cursor = raw_conn.cursor()
+                try:
+                    cursor.execute(sql)
+                    raw_conn.commit()
+                finally:
+                    cursor.close()
 
-            clean_notices = []
-            for notice in notices:
-                clean_notice = notice.replace('NOTICE: ', '').strip()
-                if clean_notice:
-                    clean_notices.append(clean_notice)
+                # psycopg2 populates raw_conn.notices with RAISE NOTICE messages
+                collected_notices = []
+                for n in raw_conn.notices:
+                    clean = n.replace('NOTICE:  ', '').replace('NOTICE: ', '').strip()
+                    if clean:
+                        collected_notices.append(clean)
+
+                self.logger.info(f"[PL/SQL] Execution complete. Notices collected: {collected_notices}")
+            finally:
+                # Return connection to pool instead of closing it
+                raw_conn.close()
 
             return {
                 "status": "Success!!",
-                "notices": clean_notices or ["No notices raised."],
+                "notices": collected_notices,
                 "refresh": True
             }
         except Exception as e:
-            if 'temp_handler' in locals():
-                pg_logger.removeHandler(temp_handler)
-            pg_logger.setLevel(original_level)
             raise Exception(f"Execution failed: {str(e)}")
         
     def supports_user_management(self):
@@ -2288,27 +2352,26 @@ SELECT update_marks(1, 95);"""
         }
             
     def build_column_definitions(self, schema, quote=True):
-        """Build column definition strings for table creation"""
+        """Build column definition strings for table creation.
+
+        Supports composite primary keys: when more than one column has pk=True,
+        inline PRIMARY KEY constraints are omitted from column definitions and a
+        table-level PRIMARY KEY (...) clause is appended instead.
+        """
+        import re
         columns_def = []
-        
-        RESERVED_KEYWORDS = {
-            'user', 'group', 'order', 'table', 'column', 'select', 'from', 'where',
-            'insert', 'update', 'delete', 'create', 'drop', 'alter', 'grant', 'revoke',
-            'index', 'view', 'trigger', 'function', 'procedure', 'database', 'schema',
-            'primary', 'foreign', 'references', 'constraint', 'default', 'check',
-            'unique', 'null', 'not', 'and', 'or', 'in', 'exists', 'between', 'like',
-            'is', 'as', 'on', 'join', 'left', 'right', 'inner', 'outer', 'cross',
-            'union', 'intersect', 'except', 'case', 'when', 'then', 'else', 'end',
-            'all', 'any', 'some', 'distinct', 'having', 'limit', 'offset'
-        }
-        
+
+        # Detect composite PK up front
+        pk_columns = [col for col in schema if col.get('pk')]
+        has_composite_pk = len(pk_columns) > 1
+
         for col in schema:
             col_type = col['type']
             col_name_raw = col['name']
-            
+
             # CRITICAL FIX: ALWAYS quote column names to handle reserved keywords
             col_name = self._quote_identifier(col_name_raw)
-            
+
             # Convert autoincrement to SERIAL types
             if col.get('autoincrement'):
                 if 'BIGINT' in col_type.upper():
@@ -2317,41 +2380,51 @@ SELECT update_marks(1, 95);"""
                     col_type = 'SMALLSERIAL'
                 else:
                     col_type = 'SERIAL'
-            
+
             col_def = f"{col_name} {col_type}"
-            
+
             if col.get('pk'):
-                col_def += " PRIMARY KEY"
+                if not has_composite_pk:
+                    col_def += " PRIMARY KEY"
+                # else: composite PK — skip inline; table-level clause added below
             else:
                 if col.get('notnull'):
                     col_def += " NOT NULL"
                 if col.get('unique'):
                     col_def += " UNIQUE"
-            
-            # ✅ ADD CHECK CONSTRAINT with properly quoted identifiers
+
+            # ADD CHECK CONSTRAINT with properly quoted identifiers
             if col.get('check_constraint'):
                 check_expr = col['check_constraint']
-                # Ensure column name in CHECK expression is quoted (for reserved keywords)
                 col_name_unquoted = col['name']
-                # Replace unquoted column references with quoted ones
-                import re
                 quoted_check_expr = re.sub(
                     r'\b' + re.escape(col_name_unquoted) + r'\b',
                     f'"{col_name_unquoted}"',
                     check_expr
                 )
                 col_def += f" CHECK ({quoted_check_expr})"
-            
+
             columns_def.append(col_def)
-        
+
+        # Append composite PRIMARY KEY table-level constraint
+        if has_composite_pk:
+            pk_col_names = [self._quote_identifier(col['name']) for col in pk_columns]
+            columns_def.append(f"PRIMARY KEY ({', '.join(pk_col_names)})")
+            self.logger.debug(f"Added composite PK clause: PRIMARY KEY ({', '.join(pk_col_names)})")
+
         return columns_def
     
     def build_column_definition_for_create(self, quoted_name, type_with_length, is_pk, is_not_null, is_autoincrement, is_unique, table_name=None, has_composite_pk=False):
-        """Build column definition for CREATE TABLE"""
+        """Build column definition for CREATE TABLE.
+
+        When has_composite_pk=True the caller is responsible for appending a
+        table-level PRIMARY KEY (...) clause; this method omits the inline
+        PRIMARY KEY keyword for the affected columns.
+        """
         base_type = type_with_length.split('(')[0].upper()
         
-        # Convert INTEGER to SERIAL for autoincrement
-        if is_autoincrement:
+        # Convert INTEGER to SERIAL for autoincrement (only for single-PK columns)
+        if is_autoincrement and not has_composite_pk:
             if base_type in ['INTEGER', 'INT']:
                 col_def = f"{quoted_name} SERIAL"
             elif base_type == 'BIGINT':
@@ -2364,7 +2437,7 @@ SELECT update_marks(1, 95);"""
             col_def = f"{quoted_name} {type_with_length}"
         
         # Add constraints
-        if is_pk:
+        if is_pk and not has_composite_pk:
             col_def += " PRIMARY KEY"
         else:
             if is_not_null:
@@ -2956,12 +3029,21 @@ with engine.connect() as conn:
         new_parts = []
         
         for part in parts:
-            # Skip table-level PK constraints we'll handle via SERIAL
+            # Handle table-level PK constraints
             if re.search(r'^\s*(PRIMARY KEY|CONSTRAINT.*PRIMARY KEY)', part, re.IGNORECASE):
                 pk_match = re.search(r'\(\s*(["`]?)(.*?)\1\s*\)', part, re.IGNORECASE)
                 if pk_match:
-                    pk_columns.add(pk_match.group(2))
-                continue  # Drop this constraint if we're upgrading to SERIAL
+                    cols_in_clause = [c.strip().strip('"`') for c in pk_match.group(2).split(',')]
+                    if len(cols_in_clause) == 1:
+                        # Single-column table-level PK — record it and drop the clause;
+                        # the column will be upgraded to SERIAL PRIMARY KEY inline
+                        pk_columns.add(cols_in_clause[0])
+                        continue  # drop this constraint
+                    else:
+                        # Composite PK — preserve as-is, do NOT try to convert to SERIAL
+                        new_parts.append(part)
+                        continue
+                continue  # No parentheses found — drop safely
             
             # Look for column definitions with inline PRIMARY KEY
             col_match = re.match(r'\s*(["`]?)([^"\s]+)\1\s+(INTEGER|BIGINT|SMALLINT)', part, re.IGNORECASE)
@@ -3005,16 +3087,17 @@ with engine.connect() as conn:
         return new_sql
     
     def _get_primary_keys_from_create(self, columns_part):
-        """Extract PK column names from CREATE TABLE definition"""
+        """Extract PK column names from CREATE TABLE definition (handles composite PKs)"""
         import re
-        pk_match = re.search(r'PRIMARY KEY\s*\(\s*"?(.*?)"?\s*\)', columns_part, re.IGNORECASE)
+        pk_match = re.search(r'PRIMARY KEY\s*\(\s*(.+?)\s*\)', columns_part, re.IGNORECASE)
         if pk_match:
-            return {pk_match.group(1)}
-        # Handle inline PRIMARY KEY
+            # Split by comma and strip quotes/whitespace from each column name
+            return {c.strip().strip('"\'`') for c in pk_match.group(1).split(',')}
+        # Handle inline PRIMARY KEY on individual columns
         pks = set()
         for col in columns_part.split(','):
             if re.search(r'\bPRIMARY KEY\b', col, re.IGNORECASE):
-                name_match = re.match(r'^\s*"?(\w+)"?', col.strip())
+                name_match = re.match(r'^\s*["`]?(\w+)["`]?', col.strip())
                 if name_match:
                     pks.add(name_match.group(1))
         return pks
@@ -3125,7 +3208,7 @@ with engine.connect() as conn:
         return True
 
     def supports_partition_creation(self):
-        return False
+        return True
 
     def supports_partition_deletion(self):
         return True
@@ -3136,95 +3219,264 @@ with engine.connect() as conn:
             return []
         
         with self._get_connection() as conn:
-            if self.DB_NAME == 'MySQL':
-                result = conn.execute(text("""
-                    SELECT 
-                        PARTITION_NAME as name,
-                        PARTITION_METHOD as type,
-                        PARTITION_EXPRESSION as expression
-                    FROM information_schema.PARTITIONS
-                    WHERE TABLE_SCHEMA = DATABASE() 
-                        AND TABLE_NAME = :table_name
-                        AND PARTITION_NAME IS NOT NULL
-                """), {'table_name': table_name})
-                
-            elif self.DB_NAME == 'PostgreSQL':
-                result = conn.execute(text("""
-                    SELECT 
-                        c.relname as name,
-                        'RANGE' as type,
-                        pg_get_expr(c.relpartbound, c.oid) as expression
-                    FROM pg_class c
-                    JOIN pg_inherits i ON c.oid = i.inhrelid
-                    JOIN pg_class p ON i.inhparent = p.oid
-                    WHERE p.relname = :table_name
-                """), {'table_name': table_name})
-            
-            return [dict(row._mapping) for row in result.fetchall()]
+            # Detect partition strategy for display
+            strategy_result = conn.execute(text("""
+                SELECT p.partstrat
+                FROM pg_partitioned_table p
+                JOIN pg_class c ON c.oid = p.partrelid
+                WHERE c.relname = :table_name
+                AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+            """), {'table_name': table_name})
+            strategy_row = strategy_result.fetchone()
+            strategy_map = {'r': 'RANGE', 'l': 'LIST', 'h': 'HASH'}
+            partition_type = strategy_map.get(
+                strategy_row[0] if strategy_row else '', 'RANGE'
+            )
+
+            result = conn.execute(text("""
+                SELECT 
+                    c.relname as name,
+                    pg_get_expr(c.relpartbound, c.oid) as expression
+                FROM pg_class c
+                JOIN pg_inherits i ON c.oid = i.inhrelid
+                JOIN pg_class p ON i.inhparent = p.oid
+                WHERE p.relname = :table_name
+                AND p.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+                ORDER BY c.relname
+            """), {'table_name': table_name})
+
+            return [
+                {
+                    'name': row[0],
+                    'type': partition_type,
+                    'expression': row[1]
+                }
+                for row in result.fetchall()
+            ]
 
     def create_partition(self, table_name, partition_config):
-        """Create a partition on a table"""
+        """
+        Create partitions on a table for PostgreSQL.
+        PostgreSQL requires the parent table to be declared PARTITION BY at
+        creation time, so we: rename the original table, recreate it as a
+        partitioned parent, copy the data back, then create child partitions.
+        """
         if not self.supports_partitions():
             raise NotImplementedError("Partitions not supported")
-        
-        partition_type = partition_config.get('type', 'RANGE')
+
+        partition_type = partition_config.get('type', 'RANGE').upper()
         column = partition_config.get('column')
         definitions = partition_config.get('definitions', [])
-        
-        if not column or not definitions:
-            raise ValueError("Partition column and definitions required")
-        
-        with self._get_connection() as conn:
-            if self.DB_NAME == 'MySQL':
-                # MySQL: ALTER TABLE to add partitioning
-                quoted_table = self._quote_identifier(table_name)
-                partition_defs = []
-                
+
+        if not column:
+            raise ValueError("Partition column is required")
+        if partition_type != 'HASH' and not definitions:
+            raise ValueError(
+                "Partition definitions are required for RANGE and LIST partitions"
+            )
+
+        quoted_table = self._quote_identifier(table_name)
+        quoted_column = self._quote_identifier(column)
+        temp_name = f"_pgpart_backup_{table_name}"
+        quoted_temp = self._quote_identifier(temp_name)
+
+        with self.engine.begin() as conn:
+            # --- Step 1: Read existing schema and data ---
+            schema = self.get_table_schema(table_name)
+            if not schema:
+                raise ValueError(f"Table '{table_name}' not found or has no columns")
+
+            rows = self.read(table_name)
+
+            # --- Step 2: Rename original table to backup ---
+            conn.execute(text(
+                f"ALTER TABLE {quoted_table} RENAME TO {quoted_temp}"
+            ))
+
+            # --- Step 3: Build column definitions for new partitioned parent ---
+            col_defs = []
+            for col in schema:
+                col_name = self._quote_identifier(col['name'])
+                col_type = col['type']
+                # Ensure VARCHAR has length
+                if col_type.upper().startswith('VARCHAR') and '(' not in col_type:
+                    col_type = 'VARCHAR(255)'
+                col_def = f"{col_name} {col_type}"
+                if col.get('notnull') and not col.get('pk'):
+                    col_def += ' NOT NULL'
+                if col.get('unique') and not col.get('pk'):
+                    col_def += ' UNIQUE'
+                col_defs.append(col_def)
+
+            col_def_str = ', '.join(col_defs)
+
+            # --- Step 4: Create partitioned parent table ---
+            conn.execute(text(
+                f"CREATE TABLE {quoted_table} ({col_def_str}) "
+                f"PARTITION BY {partition_type} ({quoted_column})"
+            ))
+
+            # --- Step 5: Create child partition tables ---
+            if partition_type == 'RANGE':
+                prev_value = 'MINVALUE'
+                for part_def in definitions:
+                    name = part_def['name']
+                    value = part_def['value'].strip()
+                    if ',' in value:
+                        raise ValueError(
+                            f"RANGE partitioning requires a single boundary value "
+                            f"per partition, got: '{value}'. Use LIST for multiple values."
+                        )
+                    quoted_part = self._quote_identifier(f"{table_name}_{name}")
+                    if value.upper() == 'MAXVALUE':
+                        conn.execute(text(
+                            f"CREATE TABLE {quoted_part} "
+                            f"PARTITION OF {quoted_table} "
+                            f"FOR VALUES FROM ({prev_value}) TO (MAXVALUE)"
+                        ))
+                    else:
+                        conn.execute(text(
+                            f"CREATE TABLE {quoted_part} "
+                            f"PARTITION OF {quoted_table} "
+                            f"FOR VALUES FROM ({prev_value}) TO ({value})"
+                        ))
+                        prev_value = value
+
+            elif partition_type == 'LIST':
                 for part_def in definitions:
                     name = part_def['name']
                     value = part_def['value']
-                    
-                    if partition_type == 'RANGE':
-                        partition_defs.append(f"PARTITION {name} VALUES LESS THAN ({value})")
-                    elif partition_type == 'LIST':
-                        partition_defs.append(f"PARTITION {name} VALUES IN ({value})")
-                
-                alter_sql = f"""
-                    ALTER TABLE {quoted_table}
-                    PARTITION BY {partition_type}({column})
-                    ({', '.join(partition_defs)})
-                """
-                
-                conn.execute(text(alter_sql))
-                conn.commit()
-                
-            elif self.DB_NAME == 'PostgreSQL':
-                # PostgreSQL: Create partitioned table structure
-                # This requires recreating the table as partitioned
-                raise NotImplementedError("PostgreSQL partitioning requires table recreation - not yet implemented")
-        
+                    values = [v.strip().strip("'\"") for v in value.split(',')]
+                    # PostgreSQL LIST supports both strings and integers
+                    try:
+                        int(values[0])
+                        in_values = ', '.join(values)
+                    except ValueError:
+                        in_values = ', '.join(f"'{v}'" for v in values)
+                    quoted_part = self._quote_identifier(f"{table_name}_{name}")
+                    conn.execute(text(
+                        f"CREATE TABLE {quoted_part} "
+                        f"PARTITION OF {quoted_table} "
+                        f"FOR VALUES IN ({in_values})"
+                    ))
+
+            elif partition_type == 'HASH':
+                partition_count = len(definitions) if definitions else 4
+                for i in range(partition_count):
+                    name = definitions[i]['name'] if definitions and i < len(definitions) else f"p{i}"
+                    quoted_part = self._quote_identifier(f"{table_name}_{name}")
+                    conn.execute(text(
+                        f"CREATE TABLE {quoted_part} "
+                        f"PARTITION OF {quoted_table} "
+                        f"FOR VALUES WITH (MODULUS {partition_count}, REMAINDER {i})"
+                    ))
+
+            else:
+                raise ValueError(f"Unsupported partition type: {partition_type}")
+
+            # --- Step 6: Copy data from backup into partitioned table ---
+            if rows:
+                col_names = [self._quote_identifier(col['name']) for col in schema]
+                col_names_str = ', '.join(col_names)
+                placeholders = ', '.join([f':{col["name"]}' for col in schema])
+                for row in rows:
+                    conn.execute(text(
+                        f"INSERT INTO {quoted_table} ({col_names_str}) "
+                        f"VALUES ({placeholders})"
+                    ), row)
+
+            # --- Step 7: Drop the backup table ---
+            conn.execute(text(f"DROP TABLE {quoted_temp}"))
+
         return True
 
-    def drop_partition(self, table_name, partition_name):
-        """Drop a partition from a table"""
-        if not self.supports_partitions():
-            raise NotImplementedError("Partitions not supported")
-        
-        with self._get_connection() as conn:
-            quoted_table = self._quote_identifier(table_name)
-            
-            if self.DB_NAME == 'MySQL':
-                conn.execute(text(
-                    f"ALTER TABLE {quoted_table} DROP PARTITION {partition_name}"
-                ))
-                conn.commit()
-                
-            elif self.DB_NAME == 'PostgreSQL':
-                quoted_partition = self._quote_identifier(partition_name)
-                conn.execute(text(f"DROP TABLE {quoted_partition}"))
-                conn.commit()
-        
-        return True
+    def get_child_partition_tables(self):
+        """
+        Return the set of table names that are PostgreSQL child partition tables.
+        These must be excluded from list_tables() during export so they are not
+        imported as independent plain tables — they are recreated by create_partition.
+        """
+        try:
+            with self._get_connection() as conn:
+                result = conn.execute(text("""
+                    SELECT c.relname
+                    FROM pg_class c
+                    JOIN pg_inherits i ON c.oid = i.inhrelid
+                    JOIN pg_partitioned_table pt ON i.inhparent = pt.partrelid
+                    WHERE c.relnamespace = (
+                        SELECT oid FROM pg_namespace WHERE nspname = 'public'
+                    )
+                """))
+                return {row[0] for row in result.fetchall()}
+        except Exception as e:
+            self.logger.debug(f"get_child_partition_tables failed: {e}")
+            return set()
+
+    def drop_partition(self, table_name, partition_name, schema="public"):
+
+        if not table_name or not partition_name:
+            raise ValueError("Table name and partition name must be provided.")
+
+        # Normalize name
+        if partition_name.startswith(f"{table_name}_"):
+            full_partition_name = partition_name
+        else:
+            full_partition_name = f"{table_name}_{partition_name}"
+
+        qualified_table = f"{schema}.{table_name}"
+        qualified_partition = f"{schema}.{full_partition_name}"
+
+        try:
+            with self.engine.begin() as conn:
+
+                # Check parent exists
+                if not conn.execute(text("SELECT to_regclass(:t)"), {"t": qualified_table}).scalar():
+                    raise ValueError(f"Table '{qualified_table}' does not exist.")
+
+                # Check partition exists
+                if not conn.execute(text("SELECT to_regclass(:p)"), {"p": qualified_partition}).scalar():
+                    raise ValueError(f"Partition '{qualified_partition}' does not exist.")
+
+                # Verify relationship
+                if not conn.execute(text("""
+                    SELECT 1 FROM pg_inherits
+                    WHERE inhrelid = CAST(:p AS regclass)
+                    AND inhparent = CAST(:t AS regclass)
+                """), {"p": qualified_partition, "t": qualified_table}).scalar():
+                    raise ValueError(f"'{qualified_partition}' is not a partition of '{qualified_table}'.")
+
+                # DETACH first
+                try:
+                    conn.execute(text(f"""
+                        ALTER TABLE "{schema}"."{table_name}"
+                        DETACH PARTITION "{schema}"."{full_partition_name}"
+                    """))
+                except Exception:
+                    pass  # ignore safely
+
+                # DROP with CASCADE fallback
+                try:
+                    conn.execute(text(f"""
+                        DROP TABLE "{schema}"."{full_partition_name}"
+                    """))
+                except Exception as drop_err:
+                    try:
+                        conn.execute(text(f"""
+                            DROP TABLE "{schema}"."{full_partition_name}" CASCADE
+                        """))
+                    except Exception as cascade_err:
+                        # 🔥 Show CLEAN but REAL reason
+                        msg = str(cascade_err).split("\n")[0]
+                        raise ValueError(f"Cannot drop partition: {msg}")
+
+            return f"Partition '{qualified_partition}' dropped successfully."
+
+        except ValueError:
+            raise
+
+        except Exception as e:
+            msg = str(e).split("\n")[0]
+            raise ValueError(f"Unexpected error: {msg}")
     
     # === NORMALIZATION SUPPORT ===
     def analyze_for_normalization(self):
@@ -3359,3 +3611,43 @@ with engine.connect() as conn:
             
     def check_constraints_inline(self):
         return True
+    
+    def get_partition_info(self, table_name):
+        """
+        Return partition metadata for a table so it can be preserved
+        during export, import, and database conversion.
+        Returns None if the table is not partitioned.
+        """
+        try:
+            with self._get_connection() as conn:
+                strategy_result = conn.execute(text("""
+                    SELECT p.partstrat,
+                           pg_get_partkeydef(c.oid) as partition_key
+                    FROM pg_partitioned_table p
+                    JOIN pg_class c ON c.oid = p.partrelid
+                    WHERE c.relname = :table_name
+                    AND c.relnamespace = (
+                        SELECT oid FROM pg_namespace WHERE nspname = 'public'
+                    )
+                """), {'table_name': table_name})
+                row = strategy_result.fetchone()
+                if not row:
+                    return None
+
+                strategy_map = {'r': 'RANGE', 'l': 'LIST', 'h': 'HASH'}
+                partition_type = strategy_map.get(row[0], 'RANGE')
+                partition_key = row[1]  # e.g. "salary" or "RANGE (salary)"
+                # Extract just the column name from the key definition
+                col_match = re.search(r'\((.+?)\)', partition_key)
+                column = col_match.group(1).strip().strip('"') if col_match else partition_key
+
+                partitions = self.list_partitions(table_name)
+
+                return {
+                    'type': partition_type,
+                    'column': column,
+                    'partitions': partitions
+                }
+        except Exception as e:
+            self.logger.debug(f"get_partition_info failed for {table_name}: {e}")
+            return None

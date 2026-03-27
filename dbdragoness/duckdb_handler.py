@@ -149,6 +149,11 @@ else:
         self.logger.info(f"🔍 Creating file at: '{path}'")
         
         if self.engine:
+            try:
+                with self.engine.connect() as _ckpt_conn:
+                    _ckpt_conn.execute(text("CHECKPOINT"))
+            except Exception:
+                pass
             self.engine.dispose()
         self.engine = create_engine(f"duckdb:///{path}")
         self.current_db = db_name
@@ -215,6 +220,11 @@ else:
         
         path = self._get_db_path(actual_db_name)
         if self.engine:
+            try:
+                with self.engine.connect() as _ckpt_conn:
+                    _ckpt_conn.execute(text("CHECKPOINT"))
+            except Exception:
+                pass
             self.engine.dispose()
         self.engine = create_engine(f"duckdb:///{path}")
         self.current_db = actual_db_name  # Use actual case from disk
@@ -251,9 +261,20 @@ else:
         if not self.engine:
             return []
         with self.engine.connect() as conn:
-            result = conn.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'")).fetchall()
-            tables = [row[0] for row in result if not row[0].startswith('_internal_id_')]
-            return tables
+            view_result = conn.execute(text(
+                "SELECT view_name FROM duckdb_views() "
+                "WHERE schema_name = 'main' AND internal = false"
+            )).fetchall()
+            view_names = {row[0] for row in view_result}
+
+            result = conn.execute(text(
+                "SELECT table_name FROM duckdb_tables() "
+                "WHERE schema_name = 'main'"
+            )).fetchall()
+            return [
+                row[0] for row in result
+                if not row[0].startswith('_internal_id_') and row[0] not in view_names
+            ]
 
     def list_tables_for_db(self, db_name):
         path = self._get_db_path(db_name)
@@ -261,9 +282,33 @@ else:
         if not path_obj.exists():
             return []
         engine = create_engine(f"duckdb:///{path}")
+        self.logger.error(f"🔍 LIST_TABLES_FOR_DB: opening fresh engine for '{db_name}' at {path}")
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'")).fetchall()
+            # Show every object and its type so we can see if views appear
+            try:
+                all_objs = conn.execute(text(
+                    "SELECT table_name, table_type FROM information_schema.tables "
+                    "WHERE table_schema='main' ORDER BY table_type, table_name"
+                )).fetchall()
+                self.logger.error(f"🔍 LIST_TABLES_FOR_DB: ALL objects in '{db_name}' (name, type): {all_objs}")
+            except Exception as _e:
+                self.logger.error(f"🔍 LIST_TABLES_FOR_DB: information_schema.tables error: {_e}")
+
+            # duckdb_views on fresh connection
+            try:
+                fresh_views = conn.execute(text(
+                    "SELECT view_name, internal FROM duckdb_views() WHERE schema_name='main'"
+                )).fetchall()
+                self.logger.error(f"🔍 LIST_TABLES_FOR_DB: duckdb_views() on fresh engine = {fresh_views}")
+            except Exception as _e:
+                self.logger.error(f"🔍 LIST_TABLES_FOR_DB: duckdb_views() error: {_e}")
+
+            result = conn.execute(text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main' AND table_type = 'BASE TABLE'"
+            )).fetchall()
             tables = [row[0] for row in result if not row[0].startswith('_internal_id_')]
+            self.logger.error(f"🔍 LIST_TABLES_FOR_DB: base-tables-only result = {tables}")
         engine.dispose()
         return tables
 
@@ -708,15 +753,19 @@ else:
         if not self.engine:
             raise Exception("No database selected")
 
+        # Dispose and recreate the engine so we never operate on a stale
+        # pooled connection whose catalog view is out of date after prior DDL.
+        if self.current_db:
+            try:
+                self.engine.dispose()
+            except Exception:
+                pass
+            path = self._get_db_path(self.current_db)
+            self.engine = create_engine(f"duckdb:///{path}")
+
         with self.engine.connect() as conn:
             try:
-                # 🔒 FORCE schema context (ABSOLUTELY REQUIRED on Linux)
-                if old_table_name.count('.') == 1:
-                    forced_schema = old_table_name.split('.')[0]
-                    conn.execute(text(f"SET schema '{forced_schema}'"))
-                    self.logger.debug(f"🔒 Forced schema context: {forced_schema}")
-
-                # ✅ CRITICAL FIX: Get fully qualified table name FIRST
+                # Get fully qualified table name
                 old_table_qualified = self._get_fully_qualified_table_name(old_table_name, conn)
                 self.logger.debug(f"Resolved old table reference: {old_table_qualified}")
                 
@@ -729,7 +778,8 @@ else:
                 self.logger.debug(f"Resolved old table reference: {old_table_qualified}")
                 
                 old_columns = {col['name']: col for col in old_schema}
-            
+                import re  # ✅ Must be here — not inside a conditional — to avoid Python unbound-local error
+
                 # Parse new column definitions - DON'T extract CHECK yet
                 new_column_info = {}
                 quoted_new_columns = []
@@ -774,8 +824,21 @@ else:
                                 self.logger.error(f"Failed to create sequence {seq_name}: {e}")
                                 raise
             
+                import re  # ✅ Import at top of try block — avoids Python unbound-local issue
+                composite_pk_cols = []  # Track columns in a table-level PK clause
+
                 # ✅ STEP 2: Build column definitions - preserve CHECK constraints
                 for col_def in new_columns:
+                    # ── Handle table-level PRIMARY KEY (...) constraint ──
+                    stripped = col_def.strip()
+                    if re.match(r'^PRIMARY\s+KEY\s*\(', stripped, re.IGNORECASE):
+                        quoted_new_columns.append(stripped)
+                        pk_match = re.search(r'PRIMARY\s+KEY\s*\(([^)]+)\)', stripped, re.IGNORECASE)
+                        if pk_match:
+                            composite_pk_cols = [c.strip().strip('"') for c in pk_match.group(1).split(',')]
+                        self.logger.info(f"Detected table-level PRIMARY KEY clause: {stripped}")
+                        continue
+
                     parts = col_def.split(maxsplit=1)
                     if len(parts) >= 2:
                         col_name = parts[0]
@@ -783,8 +846,9 @@ else:
                         rest_upper = rest.upper()
                         
                         # Detect constraints
-                        has_pk = 'PRIMARY KEY' in rest_upper
-                        has_not_null = 'NOT NULL' in rest_upper
+                        col_is_in_composite_pk = col_name in composite_pk_cols
+                        has_pk = 'PRIMARY KEY' in rest_upper or col_is_in_composite_pk
+                        has_not_null = 'NOT NULL' in rest_upper or col_is_in_composite_pk
                         has_unique = 'UNIQUE' in rest_upper
                         has_autoincrement = 'AUTOINCREMENT' in rest_upper
                         
@@ -793,7 +857,6 @@ else:
                         rest_without_check = rest
                         
                         if 'CHECK' in rest_upper:
-                            import re
                             # Match CHECK (expression) - handle nested parentheses properly
                             check_match = re.search(r'CHECK\s*\(', rest, re.IGNORECASE)
                             if check_match:
@@ -843,16 +906,18 @@ else:
                             'check_constraint': check_constraint
                         }
                     else:
-                        quoted_new_columns.append(self._quote_identifier(col_def))
-                        new_column_info[col_def] = {
-                            'definition': '',
-                            'not_null': False,
-                            'type': 'TEXT',
-                            'pk': False,
-                            'unique': False,
-                            'autoincrement': False,
-                            'check_constraint': None
-                        }
+                        stripped_single = col_def.strip()
+                        if not re.match(r'^PRIMARY\s+KEY\s*\(', stripped_single, re.IGNORECASE):
+                            quoted_new_columns.append(self._quote_identifier(col_def))
+                            new_column_info[col_def] = {
+                                'definition': '',
+                                'not_null': False,
+                                'type': 'TEXT',
+                                'pk': False,
+                                'unique': False,
+                                'autoincrement': False,
+                                'check_constraint': None
+                            }
             
                 # Create temp table with cross-platform unique name
                 import secrets
@@ -946,20 +1011,21 @@ else:
                         text(f"INSERT INTO {quoted_temp} ({insert_cols_str}) SELECT {select_cols} FROM {source_table_ref}")
                     )
             
-                # Drop old and rename - ✅ USE SIMPLE NAME FOR DROP (we're in same database)
+                # Drop old table and rename temp to final name.
+                # Use the fully qualified name — after engine recreation the
+                # connection is fresh and the qualified name is always resolvable.
                 quoted_new = self._quote_identifier(new_table_name)
-                quoted_old = self._quote_identifier(table_name_only)  # ✅ Use simple name
-                
-                # ✅ CRITICAL FIX: Check if table exists before dropping
+                quoted_old = self._quote_identifier(table_name_only)
+
                 try:
-                    conn.execute(text(f"DROP TABLE IF EXISTS {quoted_old}"))
+                    conn.execute(text(f"DROP TABLE IF EXISTS {old_table_qualified}"))
                 except Exception as drop_err:
-                    self.logger.error(f"Failed to drop old table {quoted_old}: {drop_err}")
-                    # If drop fails, try with qualified name
+                    self.logger.error(f"Failed to drop old table {old_table_qualified}: {drop_err}")
+                    # Last-resort: try plain unqualified name
                     try:
-                        conn.execute(text(f"DROP TABLE IF EXISTS {old_table_qualified}"))
-                    except Exception as qualified_drop_err:
-                        self.logger.error(f"Failed to drop with qualified name: {qualified_drop_err}")
+                        conn.execute(text(f"DROP TABLE IF EXISTS {quoted_old}"))
+                    except Exception as plain_drop_err:
+                        self.logger.error(f"Failed to drop with plain name: {plain_drop_err}")
                         raise Exception(f"Could not drop old table. Manual cleanup may be needed.")
                 
                 conn.execute(text(f"ALTER TABLE {quoted_temp} RENAME TO {quoted_new}"))
@@ -1084,76 +1150,96 @@ else:
         }
         
     def build_column_definitions(self, schema, quote=True):
-        """Build column definition strings for table creation"""
+        """Build column definition strings for table creation.
+
+        Supports composite primary keys: when more than one column has pk=True,
+        inline PRIMARY KEY constraints are omitted and a table-level
+        PRIMARY KEY (...) clause is appended instead.
+        """
         columns_def = []
-        
-        # Add this RESERVED_KEYWORDS definition at the start of the method
+
         RESERVED_KEYWORDS = {
             'table', 'select', 'from', 'where', 'insert', 'update', 'delete',
             'create', 'drop', 'alter', 'index', 'view', 'trigger', 'order',
             'group', 'having', 'limit', 'offset', 'join', 'on', 'as', 'in',
             'exists', 'case', 'when', 'then', 'else', 'end', 'union', 'all'
         }
-        
+
+        # Detect composite PK up front
+        pk_columns = [col for col in schema if col.get('pk')]
+        has_composite_pk = len(pk_columns) > 1
+
         for col in schema:
             col_type = col['type']
             col_name_raw = col['name']
-            
+
             if quote or col_name_raw.lower() in RESERVED_KEYWORDS:
                 col_name = self._quote_identifier(col_name_raw)
             else:
                 col_name = col_name_raw
-            
-            # ✅ CRITICAL FIX: DuckDB doesn't support SERIAL - keep original type
-            # Autoincrement is handled via sequences and DEFAULT nextval()
-            # Don't convert to SERIAL types
-            
+
+            # DuckDB doesn't support SERIAL — autoincrement handled via sequences
             col_def = f"{col_name} {col_type}"
-            
+
             if col.get('pk'):
-                col_def += " PRIMARY KEY"
+                if not has_composite_pk:
+                    col_def += " PRIMARY KEY"
+                else:
+                    # Composite PK member — only NOT NULL inline;
+                    # table-level PRIMARY KEY clause appended below
+                    col_def += " NOT NULL"
             else:
                 if col.get('notnull'):
                     col_def += " NOT NULL"
                 if col.get('unique'):
                     col_def += " UNIQUE"
-            
+
             # ✅ ADD CHECK CONSTRAINT
             if col.get('check_constraint'):
                 col_def += f" CHECK ({col['check_constraint']})"
-            
+
             columns_def.append(col_def)
-        
+
+        # Append composite PRIMARY KEY table-level constraint
+        if has_composite_pk:
+            pk_col_names = [
+                self._quote_identifier(col['name']) if (quote or col['name'].lower() in RESERVED_KEYWORDS)
+                else col['name']
+                for col in pk_columns
+            ]
+            columns_def.append(f"PRIMARY KEY ({', '.join(pk_col_names)})")
+            self.logger.debug(f"Added composite PK clause: PRIMARY KEY ({', '.join(pk_col_names)})")
+
         return columns_def
     
-    def build_column_definition_for_create(self, quoted_name, type_with_length, is_pk, is_not_null, is_autoincrement, is_unique, table_name=None, check_constraint=None):
-        """Build column definition for CREATE TABLE - FIXED to preserve length"""
-        
-        # ✅ CRITICAL FIX: Use type_with_length AS-IS, don't strip anything
-        # This preserves VARCHAR(100), DECIMAL(10,2), etc.
-        
+    def build_column_definition_for_create(self, quoted_name, type_with_length, is_pk, is_not_null, is_autoincrement, is_unique, table_name=None, has_composite_pk=False, check_constraint=None):
+        """Build column definition for CREATE TABLE - FIXED to preserve length.
+
+        When has_composite_pk=True the caller is responsible for appending a
+        table-level PRIMARY KEY (...) clause; this method omits the inline
+        PRIMARY KEY keyword for the affected columns.
+        """
         if is_autoincrement and table_name:
-            # Use sequence for autoincrement
             col_name = quoted_name.strip('"')
             seq_name = f"{table_name}_{col_name}_seq"
             col_def = f"{quoted_name} {type_with_length} DEFAULT nextval('{seq_name}')"
         else:
-            # ✅ KEY CHANGE: Use full type_with_length instead of extracting base type
             col_def = f"{quoted_name} {type_with_length}"
-        
-        # Add constraints
-        if is_pk:
+
+        if is_pk and not has_composite_pk:
             col_def += " PRIMARY KEY"
+        elif is_pk and has_composite_pk:
+            # Composite PK member — only NOT NULL inline
+            col_def += " NOT NULL"
         else:
             if is_not_null:
                 col_def += " NOT NULL"
             if is_unique:
                 col_def += " UNIQUE"
-        
-        # ✅ NEW: Add CHECK constraint if provided (but this should NOT be used during copy operations)
+
         if check_constraint:
             col_def += f" CHECK ({check_constraint})"
-        
+
         return col_def
     
     def reset_sequence_after_copy(self, table_name, column_name):
@@ -1192,15 +1278,77 @@ else:
         """Get all views in current database"""
         try:
             with self.engine.connect() as conn:
+                self.logger.error(f"🔍 GET_VIEWS: engine URL={self.engine.url}  current_db={self.current_db}")
+
+                # information_schema.tables — all object types with their type label
+                try:
+                    ischema_all = conn.execute(text(
+                        "SELECT table_name, table_type FROM information_schema.tables "
+                        "WHERE table_schema='main' ORDER BY table_type, table_name"
+                    )).fetchall()
+                    self.logger.error(f"🔍 GET_VIEWS: information_schema.tables = {ischema_all}")
+                except Exception as _e:
+                    self.logger.error(f"🔍 GET_VIEWS: information_schema.tables ERROR: {_e}")
+
+                # information_schema.views — standard SQL view registry
+                try:
+                    ischema_views = conn.execute(text(
+                        "SELECT table_name, view_definition FROM information_schema.views "
+                        "WHERE table_schema='main'"
+                    )).fetchall()
+                    self.logger.error(f"🔍 GET_VIEWS: information_schema.views = {ischema_views}")
+                except Exception as _e:
+                    self.logger.error(f"🔍 GET_VIEWS: information_schema.views ERROR: {_e}")
+
+                # duckdb_tables() — DuckDB catalog: base tables only
+                try:
+                    duck_tbls = conn.execute(text(
+                        "SELECT table_name FROM duckdb_tables() WHERE schema_name='main'"
+                    )).fetchall()
+                    self.logger.error(f"🔍 GET_VIEWS: duckdb_tables() = {duck_tbls}")
+                except Exception as _e:
+                    self.logger.error(f"🔍 GET_VIEWS: duckdb_tables() ERROR: {_e}")
+
+                # duckdb_views() — DuckDB catalog: views; show ALL columns to see filtering
+                try:
+                    duck_views_all = conn.execute(text(
+                        "SELECT view_name, schema_name, internal, sql FROM duckdb_views()"
+                    )).fetchall()
+                    self.logger.error(f"🔍 GET_VIEWS: duckdb_views() ALL rows = {duck_views_all}")
+                except Exception as _e:
+                    self.logger.error(f"🔍 GET_VIEWS: duckdb_views() ERROR: {_e}")
+
+                # sqlite_master equivalent — DuckDB pragma / raw catalog
+                try:
+                    pragma_views = conn.execute(text(
+                        "SELECT name, type, sql FROM sqlite_master WHERE type='view'"
+                    )).fetchall()
+                    self.logger.error(f"🔍 GET_VIEWS: sqlite_master views = {pragma_views}")
+                except Exception as _e:
+                    self.logger.error(f"🔍 GET_VIEWS: sqlite_master ERROR (expected): {_e}")
+
                 result = conn.execute(text("""
                     SELECT view_name, sql
                     FROM duckdb_views()
+                    WHERE schema_name = 'main'
+                    AND internal = false
                 """))
-                
-                return [{'name': row[0], 'definition': row[1]} for row in result.fetchall()]
+                rows = result.fetchall()
+                self.logger.error(f"🔍 GET_VIEWS: final filtered result = {rows}")
+                return [{'name': row[0], 'definition': row[1]} for row in rows]
         except Exception as e:
             self.logger.error(f"Failed to get views: {e}")
             return []
+        
+    def list_views(self):
+        """List all views in current database"""
+        with self.engine.connect() as conn:
+            result = conn.execute(text(
+                "SELECT view_name as name FROM duckdb_views() "
+                "WHERE schema_name = 'main' AND internal = false"
+            ))
+        
+            return [{'name': row[0]} for row in result.fetchall()]
 
     def create_view(self, view_name, view_definition):
         """Create a view"""
@@ -1217,25 +1365,39 @@ else:
         # Build CREATE TABLE WITHOUT autoincrement defaults
         temp_columns_def = []
         autoincrement_columns = []
-        
+
+        # Detect composite PK
+        pk_cols_list = [col for col in schema if col.get('pk')]
+        has_composite_pk = len(pk_cols_list) > 1
+
         for col in schema:
             col_name = self._quote_identifier(col['name'])
             col_type = col['type']
             col_def = f"{col_name} {col_type}"
-            
+
             if col.get('pk'):
-                col_def += " PRIMARY KEY"
+                if not has_composite_pk:
+                    col_def += " PRIMARY KEY"
+                else:
+                    # Composite PK member — only NOT NULL inline
+                    col_def += " NOT NULL"
             else:
                 if col.get('notnull'):
                     col_def += " NOT NULL"
                 if col.get('unique'):
                     col_def += " UNIQUE"
-            
+
             temp_columns_def.append(col_def)
-            
+
             if col.get('autoincrement'):
                 autoincrement_columns.append(col['name'])
-        
+
+        # Append composite PK table-level constraint
+        if has_composite_pk:
+            pk_col_names = [self._quote_identifier(col['name']) for col in pk_cols_list]
+            temp_columns_def.append(f"PRIMARY KEY ({', '.join(pk_col_names)})")
+            self.logger.debug(f"copy_table: Added composite PK clause for {dest_table}")
+
         col_def_str = ', '.join(temp_columns_def)
         quoted_dest = self._quote_identifier(dest_table)
         
@@ -1549,43 +1711,18 @@ with engine.connect() as conn:
         
     def _get_fully_qualified_table_name(self, table_name, conn):
         """
-        Get the fully qualified table name (database.schema.table) in DuckDB.
-        Returns the proper reference to use in SQL queries.
+        Build a fully qualified table reference from self.current_db.
+        Avoids querying duckdb_tables() whose catalog view can be stale
+        on a pooled connection after DDL operations.
         """
-        try:
-            # Query DuckDB's catalog to find where the table actually exists
-            catalog_query = text("""
-                SELECT database_name, schema_name, table_name
-                FROM duckdb_tables()
-                WHERE LOWER(table_name) = LOWER(:t)
-                LIMIT 1
-            """)
-            catalog_result = conn.execute(catalog_query, {'t': table_name}).fetchone()
-            
-            if catalog_result:
-                db_name = catalog_result[0]
-                schema_name = catalog_result[1]
-                actual_table = catalog_result[2]
-                
-                # Build fully qualified name based on context
-                if db_name and db_name not in ['system', 'temp', 'memory']:
-                    if schema_name and schema_name != 'main':
-                        # Full path: database.schema.table
-                        return f"{db_name}.{schema_name}.{self._quote_identifier(actual_table)}"
-                    else:
-                        # Just database.table (main schema is default)
-                        return f"{db_name}.{self._quote_identifier(actual_table)}"
-                else:
-                    # Just quoted table name for system/temp/memory
-                    return self._quote_identifier(actual_table)
-            else:
-                # Fallback: use quoted table name directly
-                self.logger.warning(f"Could not find table '{table_name}' in duckdb_tables(), using quoted name")
-                return self._quote_identifier(table_name)
-                
-        except Exception as e:
-            self.logger.warning(f"Error resolving table reference: {e}, using quoted name")
-            return self._quote_identifier(table_name)
+        # Strip any schema prefix the caller may have included
+        bare_table = table_name.split('.')[-1] if '.' in table_name else table_name
+
+        if self.current_db:
+            db_file_stem = f"{self.current_db}_duckdb"
+            return f"{self._quote_identifier(db_file_stem)}.{self._quote_identifier(bare_table)}"
+        else:
+            return self._quote_identifier(bare_table)
 
     def create_check_constraint(self, table_name, column_name, expression, conn=None):
         """Create CHECK constraint - requires table recreation in DuckDB"""
@@ -1806,15 +1943,6 @@ with engine.connect() as conn:
         """Check if database supports views"""
         return True  # All major SQL databases support views
 
-    def list_views(self):
-        """List all views in current database"""
-        with self.engine.connect() as conn:
-            result = conn.execute(text(
-                "SELECT view_name as name FROM duckdb_views()"
-            ))
-    
-            return [{'name': row[0]} for row in result.fetchall()]
-
     def create_view(self, view_name, view_query):
         """Create a new view"""
         quoted_name = self._quote_identifier(view_name)
@@ -1873,7 +2001,8 @@ with engine.connect() as conn:
                 
             elif self.DB_NAME == 'DuckDB':
                 result = conn.execute(text(
-                    "SELECT sql FROM duckdb_views() WHERE view_name = :name"
+                    "SELECT sql FROM duckdb_views() "
+                    "WHERE view_name = :name AND schema_name = 'main' AND internal = false"
                 ), {'name': view_name})
                 row = result.fetchone()
                 return row[0] if row else None

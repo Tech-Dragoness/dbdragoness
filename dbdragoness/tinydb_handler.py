@@ -337,26 +337,12 @@ else:
                 self.modify_table(old_name, new_name, [])
                 return [{"status": f"✅ Table '{old_name}' renamed to '{new_name}'"}]
 
-        # ===== EVERYTHING ELSE: TRY TO EXECUTE DIRECTLY =====
+        # ===== EVERYTHING ELSE: Execute as native TinyDB Python =====
 
         try:
-            # Try as native TinyDB Python code first
-            if 'db.' in query or 'Query()' in query:
-                return self._execute_native_tinydb(query)
-    
-            # Try as JSON
-            try:
-                query_obj = json.loads(query)
-                return self._execute_dict_query(query_obj)
-            except json.JSONDecodeError:
-                pass
-    
-            # Try as SQL-like command (INSERT, SELECT, UPDATE, DELETE, etc.)
-            return self._execute_sql_like_command(query)
-    
+            return self._execute_native_tinydb(query)
         except Exception as e:
-            # If everything fails, return the error
-            raise ValueError(f"Query execution failed: {str(e)}")
+            raise ValueError(f"Query execution failed: {str(e)}\n\nHint: Write queries as Python TinyDB expressions, e.g.:\n  db.table('users').all()\n  db.table('users').insert({{'name': 'Alice', 'age': 25}})\n  db.table('users').search(Query().age > 20)")
         
     def _execute_dict_query(self, query_dict):
         """Execute dictionary-based query"""
@@ -827,44 +813,120 @@ else:
 
     def _execute_native_tinydb(self, query):
         """
-        Execute native TinyDB Python syntax directly
-        Examples:
-        - db.table('users').search(Query().age > 25)
-        - db.table('users').all()
-        - db.table('users').insert({'name': 'John', 'age': 30})
+        Execute native TinyDB Python syntax.
+        Supports both single expressions and multi-line scripts.
+
+        Single expression examples:
+          db.table('users').all()
+          db.table('users').insert({'name': 'Alice', 'age': 25})
+          db.table('users').search(Query().age > 20)
+
+        Multi-line script examples:
+          table = db.table('users')
+          table.insert({'name': 'Bob', 'age': 30})
+
+        The last expression's value is used as the result when
+        running a script. Assignments and statements with no
+        return value produce a status message instead.
         """
-        from tinydb import Query as Q
-    
-        # Create safe execution environment
-        safe_env = {
+        from tinydb import Query as Q, TinyDB
+        import ast
+
+        # Build execution environment — expose everything a user needs
+        exec_env = {
             'db': self.db,
             'Query': Q,
             'Q': Q,
-            '__builtins__': {},
+            'TinyDB': TinyDB,
+            '__builtins__': {
+                # Safe builtins only
+                'print': print,
+                'len': len,
+                'list': list,
+                'dict': dict,
+                'set': set,
+                'tuple': tuple,
+                'str': str,
+                'int': int,
+                'float': float,
+                'bool': bool,
+                'range': range,
+                'enumerate': enumerate,
+                'zip': zip,
+                'sorted': sorted,
+                'reversed': reversed,
+                'min': min,
+                'max': max,
+                'sum': sum,
+                'any': any,
+                'all': all,
+                'isinstance': isinstance,
+                'type': type,
+                'True': True,
+                'False': False,
+                'None': None,
+            },
         }
-    
-        try:
-            # Execute the query directly
-            result = eval(query, safe_env)
-        
-            # Handle different result types
-            if isinstance(result, list):
-                # search() or all() returns list
+
+        query = query.strip()
+
+        def _format_result(result):
+            """Turn a raw TinyDB return value into a list of dicts."""
+            # Check list-of-ints BEFORE the generic list check —
+            # insert_multiple, update, and remove all return a list of doc_ids
+            if isinstance(result, list) and all(isinstance(i, int) for i in result):
+                if len(result) == 0:
+                    return [{"status": "✅ Operation completed, 0 documents affected"}]
+                return [{"status": f"✅ Done — {len(result)} document(s) affected", "doc_ids": str(result)}]
+            elif isinstance(result, list):
                 return self._normalize_results(result)
             elif isinstance(result, int):
-                # insert() returns doc_id
-                return [{"status": "Document inserted", "doc_id": result}]
+                return [{"status": f"✅ Done", "doc_id": result}]
             elif isinstance(result, dict):
-                # get() returns single document
-                return [result]
+                return self._normalize_results([result])
             elif result is None:
-                return [{"status": "Operation completed successfully"}]
+                return [{"status": "✅ Operation completed"}]
+            elif isinstance(result, bool):
+                return [{"result": str(result)}]
+            elif isinstance(result, set):
+                return [{"tables": str(sorted(result))}]
             else:
                 return [{"result": str(result)}]
-            
+
+        try:
+            # Try as a single expression first (eval)
+            try:
+                tree = ast.parse(query, mode='eval')
+                result = eval(compile(tree, '<query>', 'eval'), exec_env)
+                return _format_result(result)
+            except SyntaxError:
+                pass  # Not a single expression — fall through to exec
+
+            # Multi-line script: exec the whole thing, then try to eval
+            # the last line separately to capture its value
+            lines = query.splitlines()
+
+            # Split into "all but last" + "last line"
+            body = '\n'.join(lines[:-1])
+            last_line = lines[-1].strip()
+
+            # Run the body first
+            if body.strip():
+                exec(compile(ast.parse(body), '<query>', 'exec'), exec_env)
+
+            # Try to eval the last line to get a result
+            try:
+                last_tree = ast.parse(last_line, mode='eval')
+                result = eval(compile(last_tree, '<query>', 'eval'), exec_env)
+                return _format_result(result)
+            except SyntaxError:
+                # Last line is a statement (e.g. an assignment or insert with no capture)
+                exec(compile(ast.parse(last_line), '<query>', 'exec'), exec_env)
+                return [{"status": "✅ Operation completed"}]
+
         except Exception as e:
-            self.logger.error(f"Native TinyDB query execution error: {str(e)}")
-            raise Exception(f"Query execution failed: {str(e)}")
+            self.logger.error(f"Native TinyDB execution error: {str(e)}")
+            raise Exception(str(e))
 
     def _normalize_results(self, docs):
         """Normalize TinyDB results to use doc_id consistently"""

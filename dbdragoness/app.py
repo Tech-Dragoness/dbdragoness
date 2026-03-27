@@ -114,6 +114,21 @@ def create_app(initial_db_type, handler_name=None):
         if platform.system() != 'Windows':
             return name.lower()
         return name
+    
+    def _serialize_for_nosql(doc):
+        """Converts SQL-native types that NoSQL drivers cannot encode into JSON-safe equivalents."""
+        import decimal, datetime
+        clean = {}
+        for k, v in doc.items():
+            if isinstance(v, decimal.Decimal):
+                clean[k] = float(v)
+            elif isinstance(v, (datetime.date, datetime.datetime)):
+                clean[k] = v.isoformat()
+            elif isinstance(v, bytes):
+                clean[k] = v.decode('utf-8', errors='replace')
+            else:
+                clean[k] = v
+        return clean
             
     def format_nosql_result(result, handler):
         """Format NoSQL results - remove duplicate IDs"""
@@ -556,7 +571,18 @@ def create_app(initial_db_type, handler_name=None):
                         return jsonify({'success': False, 'error': error_msg}), 400
                 
                 elif action == 'delete':
-                    app.config['HANDLER'].delete_db(db_name)
+                    handler = app.config['HANDLER']
+                    # Dispose engine before deleting to release any file locks
+                    if hasattr(handler, 'engine') and handler.engine:
+                        handler.engine.dispose()
+                        handler.engine = None
+                    actual_handler = handler.handler if hasattr(handler, 'handler') else handler
+                    if hasattr(actual_handler, 'engine') and actual_handler.engine:
+                        actual_handler.engine.dispose()
+                        actual_handler.engine = None
+                    import gc
+                    gc.collect()
+                    handler.delete_db(db_name)
                     logger.debug(f"API: Deleted database {db_name}")
                     return jsonify({'success': True, 'message': f'Database {db_name} deleted'})
                 
@@ -597,7 +623,24 @@ def create_app(initial_db_type, handler_name=None):
             # Check if new name already exists
             if new_name in existing_dbs:
                 return jsonify({'success': False, 'error': f'Database {new_name} already exists'}), 400
-        
+
+            # Pre-capture views from the LIVE engine before create_db (and the close_db
+            # just below) dispose it.  For DuckDB, views live in the in-process engine
+            # memory; a brand-new connection to the same file reads from disk/WAL where
+            # the views may not yet be visible.  Capturing them here guarantees they are
+            # available for both the table-filter step and the view-copy step below.
+            cached_views = []
+            if app.config['DB_TYPE'] == 'sql':
+                try:
+                    _pre_h = app.config['HANDLER']
+                    _pre_ah = _pre_h.handler if hasattr(_pre_h, 'handler') else _pre_h
+                    if hasattr(_pre_ah, 'get_views'):
+                        cached_views = _pre_ah.get_views() or []
+                        if cached_views:
+                            logger.debug(f"Pre-captured {len(cached_views)} views from live engine before DB switch")
+                except Exception as _pre_e:
+                    logger.warning(f"Could not pre-capture views before engine switch: {_pre_e}")
+
             # Close current connection if it's the database being renamed
             if app.config['HANDLER'].current_db == old_name:
                 if hasattr(app.config['HANDLER'], 'handler') and hasattr(app.config['HANDLER'].handler, 'close_db'):
@@ -617,11 +660,31 @@ def create_app(initial_db_type, handler_name=None):
                 if app.config['DB_TYPE'] == 'sql':
                     handler = app.config['HANDLER']
                     actual_handler = handler.handler if hasattr(handler, 'handler') else handler
-                    
+
                     if hasattr(actual_handler, '_is_system_table'):
                         old_tables = [t for t in old_tables if not actual_handler._is_system_table(t)]
                         logger.debug(f"After filtering system tables: {len(old_tables)} tables to copy")
-                
+
+                    # Filter out views — must NOT be copied as tables; handled separately below
+                    if hasattr(actual_handler, 'get_views') or cached_views:
+                        try:
+                            handler.switch_db(old_name)
+                            live_views = actual_handler.get_views() if hasattr(actual_handler, 'get_views') else []
+                            view_names = {v['name'] for v in (live_views or cached_views)}
+                            if view_names:
+                                old_tables = [t for t in old_tables if t not in view_names]
+                                logger.debug(f"Filtered out {len(view_names)} views from table list. Tables to copy: {len(old_tables)}")
+                        except Exception as view_filter_err:
+                            logger.warning(f"Could not filter views from table list: {view_filter_err}")
+
+                    # Filter out PostgreSQL child partition tables — they are recreated
+                    # automatically by create_partition on the parent; copying them as
+                    # independent tables would duplicate data and break the partition structure
+                    child_partition_tables = _get_child_partition_tables(handler)
+                    if child_partition_tables:
+                        old_tables = [t for t in old_tables if t not in child_partition_tables]
+                        logger.debug(f"Filtered out {len(child_partition_tables)} child partition tables. Tables to copy: {len(old_tables)}")
+
                 for table in old_tables:
                     logger.debug(f"Copying table/collection: {table}")
 
@@ -985,7 +1048,20 @@ def create_app(initial_db_type, handler_name=None):
                                     app.config['HANDLER'].switch_db(old_name)
                             except Exception as fk_error:
                                 logger.warning(f"Failed to copy foreign keys for {table}: {fk_error}")
-                
+
+                        # ✅ COPY PARTITIONS (if handler supports it)
+                        if hasattr(actual_handler, 'get_partition_info'):
+                            try:
+                                app.config['HANDLER'].switch_db(old_name)
+                                partition_info = actual_handler.get_partition_info(table)
+                                if partition_info:
+                                    app.config['HANDLER'].switch_db(new_name)
+                                    _restore_partitions_if_supported(
+                                        app.config['HANDLER'], table, partition_info, None, logger
+                                    )
+                            except Exception as part_err:
+                                logger.warning(f"⚠️ Failed to copy partition info for '{table}': {part_err}")
+
                     else:
                         # NoSQL: Copy collection
                         data = app.config['HANDLER'].read(table)
@@ -1082,16 +1158,44 @@ def create_app(initial_db_type, handler_name=None):
                                 
                                 handler.switch_db(old_name)
                                 views = actual_handler.get_views()
-                                
+                                # DuckDB: views are in-process and may not survive engine
+                                # disposal; use the pre-captured snapshot when the freshly
+                                # re-opened engine returns nothing.
+                                if not views and cached_views:
+                                    logger.info(f"Live engine returned no views — using pre-captured snapshot ({len(cached_views)} views)")
+                                    views = cached_views
+
                                 logger.info(f"Found {len(views)} views in {old_name}")
                                 
                                 if views:
                                     handler.switch_db(new_name)
                                     
+                                    # Determine if this handler's create_view expects the full
+                                    # "CREATE VIEW name AS ..." statement or just the SELECT body.
+                                    # SQLite and DuckDB store/return the full statement; MySQL and
+                                    # PostgreSQL return only the SELECT body and prepend it themselves.
+                                    db_type_name = actual_handler.DB_NAME if hasattr(actual_handler, 'DB_NAME') else ''
+                                    handler_uses_full_statement = db_type_name in ('SQLite', 'DuckDB')
+                                    
                                     for view in views:
                                         try:
                                             logger.info(f"Copying view: {view['name']}")
-                                            actual_handler.create_view(view['name'], view['definition'])
+                                            vdef = view['definition'] or ''
+                                            
+                                            # If handler expects full statement but definition is
+                                            # only the SELECT body, build the full statement.
+                                            if handler_uses_full_statement and not vdef.strip().upper().startswith('CREATE'):
+                                                quoted_vname = actual_handler._quote_identifier(view['name']) if hasattr(actual_handler, '_quote_identifier') else f'"{view["name"]}"'
+                                                vdef = f"CREATE VIEW {quoted_vname} AS {vdef}"
+                                            
+                                            # If handler expects only the SELECT body but definition
+                                            # is the full statement, strip the CREATE VIEW prefix.
+                                            if not handler_uses_full_statement and vdef.strip().upper().startswith('CREATE'):
+                                                match = re.search(r'\bAS\b\s+(.+)', vdef, re.DOTALL | re.IGNORECASE)
+                                                if match:
+                                                    vdef = match.group(1).strip()
+                                            
+                                            actual_handler.create_view(view['name'], vdef)
                                             logger.info(f"✅ Successfully copied view '{view['name']}'")
                                         except Exception as view_err:
                                             logger.error(f"❌ Failed to copy view {view['name']}: {view_err}")
@@ -1180,6 +1284,136 @@ def create_app(initial_db_type, handler_name=None):
             logger.error(f"❌ API call failed: /api/databases/rename - {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
         
+    def _get_child_partition_tables(handler_obj):
+        """
+        Return the set of child partition table names for the given handler.
+        Falls back to empty set if the handler doesn't support this.
+        """
+        actual = handler_obj.handler if hasattr(handler_obj, 'handler') else handler_obj
+        if hasattr(actual, 'get_child_partition_tables'):
+            try:
+                return actual.get_child_partition_tables()
+            except Exception:
+                pass
+        return set()
+        
+    def _restore_partitions_if_supported(target_handler_obj, table_name, partition_info, conn, logger):
+        """
+        Rebuild partitions on the target handler after a plain table has been created
+        and populated.  Handles both MySQL and PostgreSQL source formats.
+
+        MySQL source  — partition_info['partitions'] rows carry a 'boundary' key
+                        (PARTITION_DESCRIPTION: e.g. '50000', 'MAXVALUE') and a
+                        'name' that is already the short name (e.g. 'low').
+        PostgreSQL source — rows carry an 'expression' key in FOR VALUES … syntax
+                        and a 'name' that is the full child table name
+                        (e.g. 'employees_low').
+
+        create_partition on both handlers manages its own transaction/connection,
+        so this must be called AFTER the outer transaction is fully committed/closed.
+
+        Returns True if partitions were applied, False otherwise.
+        """
+        if not partition_info:
+            return False
+
+        actual = target_handler_obj.handler if hasattr(target_handler_obj, 'handler') else target_handler_obj
+        if not (hasattr(actual, 'supports_partitions') and actual.supports_partitions()):
+            logger.info(f"Target DB does not support partitions — '{table_name}' kept as plain table")
+            return False
+        if not hasattr(actual, 'create_partition'):
+            return False
+
+        src_type  = partition_info.get('type', 'RANGE').upper()
+        src_col   = partition_info.get('column')
+        src_parts = partition_info.get('partitions', [])
+
+        if not src_col or not src_parts:
+            return False
+
+        # Strip the parent-table prefix that PostgreSQL uses in child table names.
+        # MySQL partition names are already short (e.g. 'low'), so this is a no-op.
+        prefix = table_name + '_'
+
+        definitions = []
+        for part in src_parts:
+            full_name = part['name']
+            short_name = full_name[len(prefix):] if full_name.startswith(prefix) else full_name
+
+            if src_type == 'RANGE':
+                # --- MySQL source: boundary is in the 'boundary' key ---
+                # PARTITION_DESCRIPTION holds e.g. '50000' or 'MAXVALUE'
+                boundary = part.get('boundary')
+                if boundary is not None:
+                    definitions.append({'name': short_name, 'value': str(boundary)})
+                    continue
+
+                # --- PostgreSQL source: boundary is inside the 'expression' key ---
+                # Expression looks like: FOR VALUES FROM (0) TO (50000)
+                expr = part.get('expression', '')
+                m = re.search(r'FROM\s+\(([^)]+)\)\s+TO\s+\(([^)]+)\)', expr, re.IGNORECASE)
+                if m:
+                    definitions.append({'name': short_name, 'value': m.group(2).strip()})
+                else:
+                    definitions.append({'name': short_name, 'value': 'MAXVALUE'})
+
+            elif src_type == 'LIST':
+                # MySQL source: boundary holds the raw IN values e.g. '1,2,3'
+                boundary = part.get('boundary')
+                if boundary is not None:
+                    definitions.append({'name': short_name, 'value': str(boundary)})
+                    continue
+
+                # PostgreSQL source: FOR VALUES IN (1, 2, 3)
+                expr = part.get('expression', '')
+                m = re.search(r'IN\s+\(([^)]+)\)', expr, re.IGNORECASE)
+                if m:
+                    definitions.append({'name': short_name, 'value': m.group(1).strip()})
+
+            elif src_type == 'HASH':
+                definitions.append({'name': short_name, 'value': ''})
+                
+        # For RANGE partitions, sort so finite boundaries come before MAXVALUE.
+        # PostgreSQL's create_partition uses a running prev_value cursor, so the
+        # catch-all MAXVALUE partition MUST be last or earlier partitions overlap.
+        if src_type == 'RANGE':
+            def _range_sort_key(d):
+                v = d['value'].strip().upper()
+                if v == 'MAXVALUE':
+                    return (1, 0)
+                try:
+                    return (0, float(v))
+                except ValueError:
+                    return (0, 0)
+            definitions.sort(key=_range_sort_key)
+
+        if not definitions:
+            logger.warning(
+                f"⚠️ Could not extract partition definitions for '{table_name}' "
+                f"— partition_info was: {partition_info}"
+            )
+            return False
+
+        partition_config = {
+            'type': src_type,
+            'column': src_col,
+            'definitions': definitions,
+        }
+
+        try:
+            actual.create_partition(table_name, partition_config)
+            logger.info(
+                f"✅ Restored {src_type} partitions on '{table_name}' "
+                f"(column='{src_col}', count={len(definitions)})"
+            )
+            return True
+        except Exception as pe:
+            logger.warning(
+                f"⚠️ Could not restore partitions on '{table_name}': {pe} "
+                f"— table left as plain"
+            )
+            return False
+
     @app.route('/api/databases/convert', methods=['POST'])
     def api_convert_database():
         """JSON API: Convert database to different type/handler - streams progress"""
@@ -1239,30 +1473,50 @@ def create_app(initial_db_type, handler_name=None):
                     
                     # Get views first so they can be excluded from table export
                     export_data['views'] = []
-                    if hasattr(current_handler, 'list_views') and hasattr(current_handler, 'get_view_definition'):
-                        try:
-                            view_list = current_handler.list_views() or []
+                    try:
+                        actual_src = current_handler.handler if hasattr(current_handler, 'handler') else current_handler
+                        # Prefer get_views() which returns name+definition together
+                        if hasattr(actual_src, 'get_views'):
+                            view_list = actual_src.get_views() or []
+                            for v in view_list:
+                                vname = v.get('name', '')
+                                vdef = v.get('definition', '') or ''
+                                if not vname or not vdef:
+                                    continue
+                                vdef = re.sub(r'\b\w+\.(\w+)\b', r'\1', vdef)
+                                export_data['views'].append({
+                                    'name': vname,
+                                    'definition': vdef,
+                                    'is_full_statement': vdef.strip().upper().startswith('CREATE')
+                                })
+                        elif hasattr(actual_src, 'list_views') and hasattr(actual_src, 'get_view_definition'):
+                            view_list = actual_src.list_views() or []
                             for v in view_list:
                                 vname = v['name']
                                 try:
-                                    vdef = current_handler.get_view_definition(vname)
-                                    if vdef:
-                                        # Strip schema-qualified table references (e.g. schema.table -> table)
-                                        # MySQL stores view definitions with fully-qualified names
-                                        vdef = re.sub(r'\b\w+\.(\w+)\b', r'\1', vdef)
-                                        export_data['views'].append({
-                                            'name': vname,
-                                            'definition': vdef,
-                                            'is_full_statement': vdef.strip().upper().startswith('CREATE')
-                                        })
+                                    vdef = actual_src.get_view_definition(vname) or ''
+                                    if not vdef:
+                                        continue
+                                    vdef = re.sub(r'\b\w+\.(\w+)\b', r'\1', vdef)
+                                    export_data['views'].append({
+                                        'name': vname,
+                                        'definition': vdef,
+                                        'is_full_statement': vdef.strip().upper().startswith('CREATE')
+                                    })
                                 except Exception as vdef_err:
                                     logger.warning(f"⚠️ Could not get definition for view '{vname}': {vdef_err}")
-                            logger.info(f"Found {len(export_data['views'])} views in {source_db}")
-                        except Exception as ve:
-                            logger.warning(f"⚠️ Could not export views: {ve}")
+                        logger.info(f"Found {len(export_data['views'])} views in {source_db}")
+                    except Exception as ve:
+                        logger.warning(f"⚠️ Could not export views: {ve}")
 
                     view_names = {v['name'] for v in export_data['views']}
-                    tables = [t for t in current_handler.list_tables() if t not in view_names]
+                    child_partition_tables = _get_child_partition_tables(current_handler)
+                    if child_partition_tables:
+                        logger.info(f"Skipping {len(child_partition_tables)} child partition table(s) from export: {child_partition_tables}")
+                    tables = [
+                        t for t in current_handler.list_tables()
+                        if t not in view_names and t not in child_partition_tables
+                    ]
                     total_tables = len(tables)
 
                     if total_tables == 0 and not export_data['views']:
@@ -1333,14 +1587,28 @@ def create_app(initial_db_type, handler_name=None):
                         
                         # Get triggers
                         if hasattr(current_handler, 'supports_triggers') and current_handler.supports_triggers():
-                            triggers = current_handler.list_triggers(table)
+                            actual_src_trig = current_handler.handler if hasattr(current_handler, 'handler') else current_handler
+                            triggers = actual_src_trig.list_triggers(table) if hasattr(actual_src_trig, 'list_triggers') else current_handler.list_triggers(table)
                             for trigger in triggers:
+                                # Handlers store body in 'sql', 'body', or 'action_statement'
+                                body = trigger.get('body') or trigger.get('sql') or trigger.get('action_statement') or ''
                                 table_data['triggers'].append({
                                     'name': trigger['name'],
-                                    'timing': trigger.get('timing'),
-                                    'event': trigger.get('event'),
-                                    'body': trigger.get('sql')
+                                    'timing': trigger.get('timing') or trigger.get('action_timing', 'AFTER'),
+                                    'event': trigger.get('event') or trigger.get('event_manipulation', 'INSERT'),
+                                    'body': body
                                 })
+                        
+                        # ✅ Capture partition metadata for cross-DB transfer
+                        actual_src_handler = current_handler.handler if hasattr(current_handler, 'handler') else current_handler
+                        if hasattr(actual_src_handler, 'get_partition_info'):
+                            try:
+                                partition_info = actual_src_handler.get_partition_info(table)
+                                if partition_info:
+                                    table_data['partition_info'] = partition_info
+                                    logger.info(f"Captured partition info for {table}: type={partition_info['type']}, column={partition_info['column']}, partitions={len(partition_info.get('partitions', []))}")
+                            except Exception as part_err:
+                                logger.debug(f"Could not capture partition info for {table}: {part_err}")
                         
                         export_data['tables'].append(table_data)
                     
@@ -1414,6 +1682,7 @@ def create_app(initial_db_type, handler_name=None):
                         db_handler_name = actual_handler.DB_NAME if hasattr(actual_handler, 'DB_NAME') else 'SQLite'
                         
                         if db_handler_name in ['DuckDB', 'PostgreSQL']:
+                            pending_partition_tables = []
                             with target_handler_obj.engine.begin() as conn:
                                 for idx, table_data in enumerate(export_data['tables']):
                                     progress = 65 + int((idx / total_tables) * 30)  # 65-95%
@@ -1425,7 +1694,10 @@ def create_app(initial_db_type, handler_name=None):
                                         table_name = table_name.lower()
                                         table_data['name'] = table_name
                                     
-                                    # Create table
+                                    # Create table — with partition awareness
+                                    partition_info = table_data.get('partition_info')
+                                    table_created_as_partitioned = False
+
                                     if table_data.get('schema') and len(table_data.get('schema', [])) > 0:
                                         normalized_schema = []
                                         for col in table_data['schema']:
@@ -1449,16 +1721,33 @@ def create_app(initial_db_type, handler_name=None):
                                         quoted_table = f'"{table_name}"'
                                     
                                     for row in table_data.get('data', []):
-                                        clean_row = {k: v for k, v in row.items() if k not in ['_id', 'doc_id']}
+                                        clean_row = {}
+                                        for k, v in row.items():
+                                            if k == 'doc_id':
+                                                continue
+                                            if k == '_id':
+                                                clean_row['id'] = str(v)
+                                            else:
+                                                clean_row[k] = v
                                         if not clean_row:
                                             continue
                                         
+                                        import decimal, datetime as _dt
                                         serialized_row = {}
                                         for k, v in clean_row.items():
                                             if v is None:
                                                 serialized_row[k] = None
                                             elif isinstance(v, (dict, list)):
-                                                serialized_row[k] = json.dumps(v)
+                                                try:
+                                                    serialized_row[k] = json.dumps(v, default=str)
+                                                except Exception:
+                                                    serialized_row[k] = str(v)
+                                            elif isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
+                                                serialized_row[k] = v.isoformat()
+                                            elif isinstance(v, decimal.Decimal):
+                                                serialized_row[k] = float(v)
+                                            elif isinstance(v, bytes):
+                                                serialized_row[k] = v.decode('utf-8', errors='replace')
                                             else:
                                                 serialized_row[k] = v
                                         
@@ -1505,6 +1794,12 @@ def create_app(initial_db_type, handler_name=None):
                                                 logger.info(f"✅ Imported trigger: {trigger_name}")
                                             except Exception as trig_err:
                                                 logger.warning(f"⚠️ Failed to import trigger {trigger.get('name')}: {trig_err}")
+
+                                    # ✅ Restore partitions — must run AFTER the outer transaction
+                                    # is committed, since create_partition manages its own transaction.
+                                    if partition_info:
+                                        # Capture data before the transaction closes
+                                        pending_partition_tables.append((table_name, partition_info))
                                     
                                     # Apply CHECK constraints
                                     check_constraints_to_apply = []
@@ -1610,6 +1905,7 @@ def create_app(initial_db_type, handler_name=None):
                         
                         else:
                             # Other SQL databases - same logic as above
+                            pending_partition_tables = []  # ✅ FIX: initialise here for MySQL/SQLite branch
                             with target_handler_obj._get_connection() as conn:
                                 # ✅ Don't use explicit BEGIN for handlers that manage transactions
                                 if db_handler_name not in ['DuckDB']:
@@ -1622,6 +1918,8 @@ def create_app(initial_db_type, handler_name=None):
                                         
                                         table_name = table_data['name']
                                         
+                                        partition_info = table_data.get('partition_info')
+
                                         if table_data.get('schema') and len(table_data.get('schema', [])) > 0:
                                             normalized_schema = []
                                             for col in table_data['schema']:
@@ -1630,7 +1928,14 @@ def create_app(initial_db_type, handler_name=None):
                                                 normalized_type = _normalize_datatype(original_type, target_handler_obj)
                                                 col_copy['type'] = normalized_type
                                                 normalized_schema.append(col_copy)
-                                            _create_table_from_schema(target_handler_obj, table_name, normalized_schema, conn)
+
+                                            if partition_info:
+                                                _create_table_from_schema(target_handler_obj, table_name, normalized_schema, conn)
+                                                _restore_partitions_if_supported(
+                                                    target_handler_obj, table_name, partition_info, conn, logger
+                                                )
+                                            else:
+                                                _create_table_from_schema(target_handler_obj, table_name, normalized_schema, conn)
                                         else:
                                             if table_data.get('data') and len(table_data['data']) > 0:
                                                 inferred_schema = _infer_schema_from_data(table_data['data'], table_name)
@@ -1644,16 +1949,33 @@ def create_app(initial_db_type, handler_name=None):
                                             quoted_table = f'"{table_name}"'
                                         
                                         for row in table_data.get('data', []):
-                                            clean_row = {k: v for k, v in row.items() if k not in ['_id', 'doc_id']}
+                                            clean_row = {}
+                                            for k, v in row.items():
+                                                if k == 'doc_id':
+                                                    continue
+                                                if k == '_id':
+                                                    clean_row['id'] = str(v)
+                                                else:
+                                                    clean_row[k] = v
                                             if not clean_row:
                                                 continue
                                             
+                                            import decimal, datetime as _dt
                                             serialized_row = {}
                                             for k, v in clean_row.items():
                                                 if v is None:
                                                     serialized_row[k] = None
                                                 elif isinstance(v, (dict, list)):
-                                                    serialized_row[k] = json.dumps(v)
+                                                    try:
+                                                        serialized_row[k] = json.dumps(v, default=str)
+                                                    except Exception:
+                                                        serialized_row[k] = str(v)
+                                                elif isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
+                                                    serialized_row[k] = v.isoformat()
+                                                elif isinstance(v, decimal.Decimal):
+                                                    serialized_row[k] = float(v)
+                                                elif isinstance(v, bytes):
+                                                    serialized_row[k] = v.decode('utf-8', errors='replace')
                                                 else:
                                                     serialized_row[k] = v
                                             
@@ -1667,6 +1989,10 @@ def create_app(initial_db_type, handler_name=None):
                                             insert_stmt = f"INSERT INTO {quoted_table} ({quoted_cols}) VALUES ({placeholders})"
                                             conn.execute(text(insert_stmt), serialized_row)
                                         
+                                        # ✅ Queue partition restore for after the transaction closes
+                                        if table_data.get('partition_info'):
+                                            pending_partition_tables.append((table_name, table_data['partition_info']))
+
                                         # ✅ CRITICAL: Apply CHECK constraints AFTER data copy (MySQL/SQLite)
                                         check_constraints_to_apply = []
 
@@ -1802,6 +2128,31 @@ def create_app(initial_db_type, handler_name=None):
                                     if db_handler_name != 'DuckDB':
                                         conn.execute(text("ROLLBACK"))
                                     raise e
+                        
+                        # ✅ Outer transaction is now closed — safe to restore partitions
+                        for pt_table_name, pt_info in pending_partition_tables:
+                            _restore_partitions_if_supported(
+                                target_handler_obj, pt_table_name, pt_info, None, logger
+                            )
+
+                        # ✅ Import views for MySQL/SQLite conversion target (after all tables exist)
+                        actual_handler_v = target_handler_obj.handler if hasattr(target_handler_obj, 'handler') else target_handler_obj
+                        if hasattr(actual_handler_v, 'create_view'):
+                            for view in export_data.get('views', []):
+                                try:
+                                    vname = view.get('name', '')
+                                    vdef = view.get('definition', '') or ''
+                                    if not vname or not vdef:
+                                        continue
+                                    is_full = view.get('is_full_statement', False)
+                                    if is_full:
+                                        m = re.search(r'\bAS\b\s+([\s\S]+)', vdef, re.IGNORECASE)
+                                        if m:
+                                            vdef = m.group(1).strip()
+                                    actual_handler_v.create_view(vname, vdef)
+                                    logger.info(f"✅ Imported view '{vname}' (MySQL/SQLite target)")
+                                except Exception as view_err:
+                                    logger.warning(f"⚠️ Failed to import view '{view.get('name')}': {view_err}")
                     
                     else:
                         # NoSQL import
@@ -1829,7 +2180,7 @@ def create_app(initial_db_type, handler_name=None):
                                 if not clean_doc:
                                     continue
                                 
-                                target_handler_obj.insert(collection_name, clean_doc)
+                                target_handler_obj.insert(collection_name, _serialize_for_nosql(clean_doc))
                             
                             # ✅ CRITICAL FIX: Actually apply validation rules from CHECK constraints
                             check_constraints = table_data.get('constraints', {}).get('check', [])
@@ -1995,9 +2346,34 @@ def create_app(initial_db_type, handler_name=None):
             handler = app.config['HANDLER']
             
             if app.config['DB_TYPE'] == 'sql':
+                # Guard: refuse to copy views as tables
+                actual_handler = handler.handler if hasattr(handler, 'handler') else handler
+                if hasattr(actual_handler, 'get_views'):
+                    try:
+                        view_names = {v['name'] for v in (actual_handler.get_views() or [])}
+                        if table_name in view_names:
+                            return jsonify({'success': False, 'error': f'"{table_name}" is a view, not a table. Use the Views panel to manage views.'}), 400
+                    except Exception:
+                        pass
+
                 # SQL: Use handler's copy_table method if available
                 if hasattr(handler, 'copy_table'):
+                    # Capture partition info BEFORE copy (copy_table creates a plain table)
+                    actual_handler = handler.handler if hasattr(handler, 'handler') else handler
+                    partition_info = None
+                    if hasattr(actual_handler, 'get_partition_info'):
+                        try:
+                            partition_info = actual_handler.get_partition_info(table_name)
+                        except Exception:
+                            partition_info = None
+
                     handler.copy_table(table_name, new_name)
+
+                    # Restore partitions on the new table if the source was partitioned
+                    if partition_info:
+                        _restore_partitions_if_supported(
+                            handler, new_name, partition_info, None, logger
+                        )
                 else:
                     # Fallback: manual copy
                     schema = handler.get_table_schema(table_name)
@@ -3249,9 +3625,21 @@ def create_app(initial_db_type, handler_name=None):
                         # Wrap single dict result
                         result = [result]
         
+                # ✅ Determine result_type so the frontend can branch correctly
+                if isinstance(result, list) and len(result) > 0:
+                    result_type = 'table'
+                elif isinstance(result, list) and len(result) == 0:
+                    result_type = 'empty'
+                elif isinstance(result, dict) and 'rows_affected' in result:
+                    result_type = 'status'
+                else:
+                    result_type = 'status'
+
                 return jsonify({
                     'success': True,
-                    'result': result
+                    'result': result,
+                    'result_type': result_type,
+                    'refresh': result_type in ('status', 'empty')  # ✅ Tell frontend to refresh data tab
                 })
     
             except Exception as e:
@@ -3262,6 +3650,7 @@ def create_app(initial_db_type, handler_name=None):
         except Exception as e:
             logger.error(f"❌ API call failed: /api/db/{db_name}/query - {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
+        
     @app.route('/api/db/<db_name>/aggregation', methods=['POST'])
     def api_db_aggregation(db_name):
         """JSON API: Execute aggregation query (SQL: GROUP BY, NoSQL: aggregation pipeline)"""
@@ -3364,13 +3753,24 @@ def create_app(initial_db_type, handler_name=None):
                     else:
                         query_parts.append(table)
                     
-                    # Add JOIN if specified
-                    if join_config:
+                    # Add JOINs — support both legacy single join_config and new joins array
+                    joins_list = data.get('joins')  # New: array of joins
+                    if joins_list:
+                        for j in joins_list:
+                            j_table = j.get('table')
+                            j_alias = j.get('table_alias')
+                            j_on = j.get('on')
+                            j_type = j.get('type', 'INNER')
+                            if j_table and j_on:
+                                if j_alias:
+                                    query_parts.append(f"{j_type} JOIN {j_table} AS {j_alias} ON {j_on}")
+                                else:
+                                    query_parts.append(f"{j_type} JOIN {j_table} ON {j_on}")
+                    elif join_config:
                         join_table = join_config.get('table')
                         join_table_alias = join_config.get('table_alias')
-                        join_on = join_config.get('on')  # e.g., "table1.id = table2.id"
-                        join_type = join_config.get('type', 'INNER')  # INNER, LEFT, RIGHT
-                        
+                        join_on = join_config.get('on')
+                        join_type = join_config.get('type', 'INNER')
                         if join_table and join_on:
                             if join_table_alias:
                                 query_parts.append(f"{join_type} JOIN {join_table} AS {join_table_alias} ON {join_on}")
@@ -3380,6 +3780,11 @@ def create_app(initial_db_type, handler_name=None):
                     # Add GROUP BY
                     if group_by:
                         query_parts.append(f"GROUP BY {group_by}")
+                    
+                    # Add HAVING
+                    having = data.get('having')
+                    if having and group_by:
+                        query_parts.append(f"HAVING {having}")
                     
                     # Add ORDER BY
                     if order_by:
@@ -3552,6 +3957,7 @@ def create_app(initial_db_type, handler_name=None):
                 # Build column definitions
                 new_columns = []
                 has_pk = False
+                pk_col_names = []  # Track all PK column names for composite PK support
             
                 # Get handler type
                 handler = app.config['HANDLER']
@@ -3573,12 +3979,8 @@ def create_app(initial_db_type, handler_name=None):
                         }), 400
 
                     if is_pk:
-                        if has_pk:
-                            return jsonify({
-                                'success': False,
-                                'error': 'Only one primary key allowed.'
-                            }), 400
                         has_pk = True
+                        pk_col_names.append(name)
 
                     # ✅ POSTGRESQL FIX: Convert INTEGER + autoincrement to SERIAL
                     if db_name_type == 'PostgreSQL' and is_autoincrement:
@@ -3598,21 +4000,29 @@ def create_app(initial_db_type, handler_name=None):
                     # Get CHECK constraint from submitted data
                     check_expr = col_data.get('check_constraint', '').strip()
 
+                    # Determine if this is a composite PK scenario
+                    total_pk_count = sum(1 for c in submitted_columns if c.get('is_pk', False))
+                    is_composite_pk = total_pk_count > 1
+
                     # Build constraints based on DB type
                     if db_name_type == 'PostgreSQL':
-                        if is_pk:
+                        if is_pk and not is_composite_pk:
                             col_def += " PRIMARY KEY"
-                        else:
+                        elif not is_pk:
                             if is_not_null:
                                 col_def += " NOT NULL"
                             if is_unique:
                                 col_def += " UNIQUE"
+                        # For composite PK columns: no inline PRIMARY KEY — added as table-level clause below
                     elif db_name_type == 'MySQL':
-                        if is_pk:
+                        if is_pk and not is_composite_pk:
                             if is_autoincrement:
                                 col_def += " AUTO_INCREMENT PRIMARY KEY"
                             else:
                                 col_def += " PRIMARY KEY"
+                        elif is_pk and is_composite_pk:
+                            # Composite PK column — no inline PRIMARY KEY
+                            pass
                         else:
                             if is_autoincrement:
                                 col_def += " AUTO_INCREMENT UNIQUE NOT NULL"
@@ -3673,11 +4083,14 @@ def create_app(initial_db_type, handler_name=None):
                             col_def += f' CHECK ({mysql_check})'
                             logger.debug(f"✅ Added CHECK constraint to {name}: {mysql_check}")
                     else:  # SQLite, DuckDB
-                        if is_pk:
+                        if is_pk and not is_composite_pk:
                             if is_autoincrement:
                                 col_def += " PRIMARY KEY AUTOINCREMENT"
                             else:
                                 col_def += " PRIMARY KEY"
+                        elif is_pk and is_composite_pk:
+                            # Composite PK column — no inline PRIMARY KEY
+                            pass
                         else:
                             if is_not_null:
                                 col_def += " NOT NULL"
@@ -3693,6 +4106,18 @@ def create_app(initial_db_type, handler_name=None):
 
                     logger.debug(f"Column {name}: type={type_}, is_pk={is_pk}, is_autoincrement={is_autoincrement}, col_def={col_def}")
                     new_columns.append(col_def)
+
+                # If composite PK, append a table-level PRIMARY KEY clause
+                if len(pk_col_names) > 1:
+                    if db_name_type == 'PostgreSQL':
+                        quoted_pks = ', '.join([f'"{c}"' for c in pk_col_names])
+                    elif db_name_type == 'MySQL':
+                        quoted_pks = ', '.join([f'`{c}`' for c in pk_col_names])
+                    else:
+                        quoted_pks = ', '.join([f'"{c}"' for c in pk_col_names])
+                    composite_pk_clause = f"PRIMARY KEY ({quoted_pks})"
+                    new_columns.append(composite_pk_clause)
+                    logger.info(f"Added composite PK clause: {composite_pk_clause}")
 
                 if not new_columns:
                     return jsonify({
@@ -4072,6 +4497,7 @@ def create_app(initial_db_type, handler_name=None):
 
             # Validate columns
             has_pk = False
+            pk_col_names_create = []  # Track PK columns for composite PK support
 
             # ✅ Validate CHECK constraints
             handler = app.config['HANDLER']
@@ -4134,11 +4560,9 @@ def create_app(initial_db_type, handler_name=None):
 
                 if is_pk:
                     if has_pk:
-                        return jsonify({
-                            'success': False,
-                            'error': 'Only one primary key allowed.'
-                        }), 400
+                        pass  # Multiple PKs allowed — composite key
                     has_pk = True
+                    pk_col_names_create.append(name)
 
                 # ✅ Use type_ AS-IS (already includes length from frontend)
                 quoted_name = name
@@ -4160,17 +4584,19 @@ def create_app(initial_db_type, handler_name=None):
                         is_not_null, 
                         is_autoincrement, 
                         is_unique,
-                        table_name
+                        table_name,
+                        has_composite_pk=len(pk_col_names_create) > 1
                     )
                 else:
                     # Fallback: build generic definition
                     col_def = f"{quoted_name} {base_type_with_length}"
+                    is_composite_pk_create = len(pk_col_names_create) > 1
                     
-                    if is_pk:
+                    if is_pk and not is_composite_pk_create:
                         col_def += " PRIMARY KEY"
                         if is_autoincrement:
                             col_def += " AUTOINCREMENT"
-                    else:
+                    elif not is_pk:
                         if is_not_null:
                             col_def += " NOT NULL"
                         if is_unique:
@@ -4184,6 +4610,19 @@ def create_app(initial_db_type, handler_name=None):
                 logger.debug(f"Create table - Column {name}: type={type_}, is_pk={is_pk}, is_autoincrement={is_autoincrement}, check={check_expr}, col_def={col_def}")
 
                 col_defs.append(col_def)
+
+            # If composite PK, append table-level PRIMARY KEY clause
+            if len(pk_col_names_create) > 1:
+                if db_handler_name == 'MySQL':
+                    quoted_pks = ', '.join([f'`{c}`' for c in pk_col_names_create])
+                else:
+                    if hasattr(actual_handler, '_quote_identifier'):
+                        quoted_pks = ', '.join([actual_handler._quote_identifier(c) for c in pk_col_names_create])
+                    else:
+                        quoted_pks = ', '.join([f'"{c}"' for c in pk_col_names_create])
+                composite_pk_clause = f"PRIMARY KEY ({quoted_pks})"
+                col_defs.append(composite_pk_clause)
+                logger.info(f"Added composite PK clause to CREATE TABLE: {composite_pk_clause}")
 
             if not col_defs:
                 return jsonify({
@@ -6192,8 +6631,9 @@ def create_app(initial_db_type, handler_name=None):
                 sql_content.append(f"USE {db_name};")
                 sql_content.append("")
                 
-                # Get all tables
-                tables = handler.list_tables()
+                # Get all tables, excluding child partition tables (they are emitted inline with their parent)
+                child_partition_tables = _get_child_partition_tables(handler)
+                tables = [t for t in handler.list_tables() if t not in child_partition_tables]
                 
                 for table in tables:
                     sql_content.append(f"-- Table: {table}")
@@ -6269,11 +6709,34 @@ def create_app(initial_db_type, handler_name=None):
                     else:
                         columns_def = actual_handler.build_column_definitions(schema, quote=False)
                     
-                    sql_content.append(f"DROP TABLE IF EXISTS {table};")
-                    sql_content.append(f"CREATE TABLE {table} (")
-                    sql_content.append("  " + ",\n  ".join(columns_def))
-                    sql_content.append(");")
-                    sql_content.append("")
+                    # ✅ Check if this table is partitioned
+                    actual_handler_ref = handler.handler if hasattr(handler, 'handler') else handler
+                    partition_info = None
+                    if hasattr(actual_handler_ref, 'get_partition_info'):
+                        try:
+                            partition_info = actual_handler_ref.get_partition_info(table)
+                        except Exception:
+                            partition_info = None
+
+                    sql_content.append(f"DROP TABLE IF EXISTS {table} CASCADE;")
+                    if partition_info:
+                        part_type = partition_info['type']
+                        part_col = partition_info['column']
+                        sql_content.append(f"CREATE TABLE {table} (")
+                        sql_content.append("  " + ",\n  ".join(columns_def))
+                        sql_content.append(f") PARTITION BY {part_type} ({part_col});")
+                        sql_content.append("")
+                        # Emit child partition tables
+                        for part in partition_info.get('partitions', []):
+                            sql_content.append(
+                                f"CREATE TABLE {part['name']} PARTITION OF {table} {part['expression']};"
+                            )
+                        sql_content.append("")
+                    else:
+                        sql_content.append(f"CREATE TABLE {table} (")
+                        sql_content.append("  " + ",\n  ".join(columns_def))
+                        sql_content.append(");")
+                        sql_content.append("")
                     
                     # NOW insert the data (rows variable is already defined above)
                     if rows:
@@ -6344,7 +6807,8 @@ def create_app(initial_db_type, handler_name=None):
                     'tables': []
                 }
                 
-                tables = handler.list_tables()
+                child_partition_tables = _get_child_partition_tables(handler)
+                tables = [t for t in handler.list_tables() if t not in child_partition_tables]
                 
                 for table in tables:
                     table_data = {
@@ -6355,7 +6819,6 @@ def create_app(initial_db_type, handler_name=None):
                         'triggers': [],
                         'indexes': []
                     }
-                    
                     # Get schema (SQL only)
                     if app.config['DB_TYPE'] == 'sql':
                         schema = handler.get_table_schema(table)
@@ -6420,6 +6883,17 @@ def create_app(initial_db_type, handler_name=None):
                                 'event': trigger.get('event'),
                                 'body': trigger.get('sql')
                             })
+                    
+                    # ✅ Capture partition metadata so it survives export/import
+                    actual_handler_ref = handler.handler if hasattr(handler, 'handler') else handler
+                    if hasattr(actual_handler_ref, 'get_partition_info'):
+                        try:
+                            partition_info = actual_handler_ref.get_partition_info(table)
+                            if partition_info:
+                                table_data['partition_info'] = partition_info
+                                logger.debug(f"Captured partition info for {table}: {partition_info}")
+                        except Exception as part_err:
+                            logger.debug(f"Could not capture partition info for {table}: {part_err}")
                     
                     export_data['tables'].append(table_data)
                 
@@ -6540,11 +7014,33 @@ def create_app(initial_db_type, handler_name=None):
                 else:
                     columns_def = actual_handler.build_column_definitions(schema, quote=False)
                 
-                sql_content.append(f"DROP TABLE IF EXISTS {table_name};")
-                sql_content.append(f"CREATE TABLE {table_name} (")
-                sql_content.append("  " + ",\n  ".join(columns_def))
-                sql_content.append(");")
-                sql_content.append("")
+                # ✅ Check if this table is partitioned
+                actual_handler_ref = handler.handler if hasattr(handler, 'handler') else handler
+                partition_info = None
+                if hasattr(actual_handler_ref, 'get_partition_info'):
+                    try:
+                        partition_info = actual_handler_ref.get_partition_info(table_name)
+                    except Exception:
+                        partition_info = None
+
+                sql_content.append(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+                if partition_info:
+                    part_type = partition_info['type']
+                    part_col = partition_info['column']
+                    sql_content.append(f"CREATE TABLE {table_name} (")
+                    sql_content.append("  " + ",\n  ".join(columns_def))
+                    sql_content.append(f") PARTITION BY {part_type} ({part_col});")
+                    sql_content.append("")
+                    for part in partition_info.get('partitions', []):
+                        sql_content.append(
+                            f"CREATE TABLE {part['name']} PARTITION OF {table_name} {part['expression']};"
+                        )
+                    sql_content.append("")
+                else:
+                    sql_content.append(f"CREATE TABLE {table_name} (")
+                    sql_content.append("  " + ",\n  ".join(columns_def))
+                    sql_content.append(");")
+                    sql_content.append("")
                 
                 # Get data
                 rows = handler.read(table_name)
@@ -6655,6 +7151,16 @@ def create_app(initial_db_type, handler_name=None):
                             'body': trigger.get('sql')
                         })
                 
+                # ✅ Capture partition metadata
+                actual_handler_ref = handler.handler if hasattr(handler, 'handler') else handler
+                if hasattr(actual_handler_ref, 'get_partition_info'):
+                    try:
+                        partition_info = actual_handler_ref.get_partition_info(table_name)
+                        if partition_info:
+                            export_data['partition_info'] = partition_info
+                    except Exception as part_err:
+                        logger.debug(f"Could not capture partition info for {table_name}: {part_err}")
+                
                 return jsonify({
                     'success': True,
                     'content': json.dumps(export_data, indent=2, default=str),
@@ -6761,15 +7267,17 @@ def create_app(initial_db_type, handler_name=None):
                 'check_constraint': None
             })
         
-        # ✅ Add auto-increment primary key if no ID field exists
-        if not any(col['name'].lower() in ['id', '_id', 'doc_id'] for col in schema):
+        # If _id was present in the data, add it as a VARCHAR primary key
+        has_id = any(col['name'].lower() == 'id' for col in schema)
+        source_has_mongo_id = any('_id' in row for row in data_rows[:1])
+        if not has_id and source_has_mongo_id:
             schema.insert(0, {
                 'name': 'id',
-                'type': 'INTEGER',
+                'type': 'VARCHAR(24)',
                 'primary_key': True,
                 'nullable': False,
                 'unique': True,
-                'autoincrement': True,
+                'autoincrement': False,
                 'check_constraint': None
             })
         
@@ -6797,25 +7305,36 @@ def create_app(initial_db_type, handler_name=None):
         # Common type mappings with modifier handling
         type_mapping = {
             'INT': 'INTEGER',
-            'INTEGER': 'INT',           # ← Crucial! PostgreSQL → MySQL
+            'INTEGER': 'INT',
             'BIGINT': 'BIGINT',
-            'BOOLEAN': 'TINYINT(1)',    
-            'TIMESTAMPTZ': 'DATETIME',  # Common in PostgreSQL
+            'BOOLEAN': 'TINYINT(1)',
+            'TIMESTAMPTZ': 'DATETIME',
+            'TIMESTAMP': 'DATETIME',
             'UUID': 'VARCHAR(36)',
             'BOOL': 'BOOLEAN',
             'STRING': 'VARCHAR',
             'CHAR': 'VARCHAR',
             'NUMERIC': 'DECIMAL',
             'FLOAT': 'DOUBLE',
-            'DATETIME': 'TIMESTAMP',
+            'DATETIME': 'DATETIME',
+            'DATE': 'DATE',
+            'TIME': 'TIME',
             'LONGTEXT': 'TEXT',
             'MEDIUMTEXT': 'TEXT',
             'TINYTEXT': 'TEXT',
-            'TINYINT': 'SMALLINT',  # TINYINT(1) commonly used for booleans
+            'TINYINT': 'SMALLINT',
             'BIGSERIAL': 'BIGINT',
             'SERIAL': 'INTEGER',
         }
         
+        # Safety net: date/time types must never fall through to DECIMAL or TEXT
+        DATE_TIME_BASES = {'DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'TIMESTAMPTZ', 'TIMETZ'}
+        if base_type in DATE_TIME_BASES:
+            for candidate in ['DATETIME', 'TIMESTAMP', 'DATE', 'TIME']:
+                if candidate in supported_types:
+                    return candidate
+            return 'VARCHAR(32)'   # Absolute last resort — store as string, never as DECIMAL
+
         # Try exact match first (with modifier)
         if base_type in supported_types:
             # Base type is supported - check if modifier is valid
@@ -7556,6 +8075,7 @@ def create_app(initial_db_type, handler_name=None):
                                             continue
                                     
                                     # ✅ FIX: Create table with proper schema handling
+                                    partition_info = table_data.get('partition_info')
                                     if table_data.get('schema') and len(table_data.get('schema', [])) > 0:
                                         # Normalize all datatypes in schema before creating table
                                         normalized_schema = []
@@ -7568,6 +8088,10 @@ def create_app(initial_db_type, handler_name=None):
                                                 logger.info(f"Normalized type for {col['name']}: {original_type} -> {normalized_type}")
                                             normalized_schema.append(col_copy)
                                         _create_table_from_schema(handler, table_name, normalized_schema, conn)
+                                        if partition_info:
+                                            _restore_partitions_if_supported(
+                                                handler, table_name, partition_info, conn, logger
+                                            )
                                     else:
                                         # ✅ FIX: No schema provided (NoSQL export) - infer from data
                                         if table_data.get('data') and len(table_data['data']) > 0:
@@ -7584,20 +8108,35 @@ def create_app(initial_db_type, handler_name=None):
                                     # Insert data - SKIP NoSQL-specific ID fields
                                     for row in table_data.get('data', []):
                                         # ✅ CRITICAL FIX: Remove NoSQL-specific ID fields
-                                        clean_row = {k: v for k, v in row.items() 
-                                                if k not in ['_id', 'doc_id']}
+                                        clean_row = {}
+                                        for k, v in row.items():
+                                            if k == 'doc_id':
+                                                continue
+                                            if k == '_id':
+                                                clean_row['id'] = str(v)
+                                            else:
+                                                clean_row[k] = v
                                         
                                         if not clean_row:
                                             continue
                                         
                                         # ✅ CRITICAL FIX: Serialize nested objects/arrays for SQL
+                                        import decimal, datetime as _dt
                                         serialized_row = {}
                                         for k, v in clean_row.items():
                                             if v is None:
                                                 serialized_row[k] = None
                                             elif isinstance(v, (dict, list)):
-                                                # Convert nested structures to JSON string
-                                                serialized_row[k] = json.dumps(v)
+                                                try:
+                                                    serialized_row[k] = json.dumps(v, default=str)
+                                                except Exception:
+                                                    serialized_row[k] = str(v)
+                                            elif isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
+                                                serialized_row[k] = v.isoformat()
+                                            elif isinstance(v, decimal.Decimal):
+                                                serialized_row[k] = float(v)
+                                            elif isinstance(v, bytes):
+                                                serialized_row[k] = v.decode('utf-8', errors='replace')
                                             else:
                                                 serialized_row[k] = v
                                         
@@ -7795,6 +8334,25 @@ def create_app(initial_db_type, handler_name=None):
                                         except Exception as proc_err:
                                             logger.warning(f"⚠️ Failed to import procedure {proc.get('name')}: {proc_err}")
                                 
+                                # Import views (after all tables exist)
+                                actual_handler_v = handler.handler if hasattr(handler, 'handler') else handler
+                                if hasattr(actual_handler_v, 'create_view'):
+                                    for view in import_data.get('views', []):
+                                        try:
+                                            vname = view.get('name', '')
+                                            vdef = view.get('definition', '') or ''
+                                            if not vname or not vdef:
+                                                continue
+                                            is_full = view.get('is_full_statement', False)
+                                            if is_full:
+                                                m = re.search(r'\bAS\b\s+([\s\S]+)', vdef, re.IGNORECASE)
+                                                if m:
+                                                    vdef = m.group(1).strip()
+                                            actual_handler_v.create_view(vname, vdef)
+                                            logger.info(f"✅ Imported view '{vname}'")
+                                        except Exception as view_err:
+                                            logger.warning(f"⚠️ Failed to import view '{view.get('name')}': {view_err}")
+
                                 # Transaction commits automatically on successful exit
                                 # Rollback happens automatically on exception - no explicit ROLLBACK needed
                             
@@ -7836,20 +8394,35 @@ def create_app(initial_db_type, handler_name=None):
                                             # Insert data - SKIP NoSQL-specific ID fields
                                             for row in table_data.get('data', []):
                                                 # ✅ CRITICAL FIX: Remove NoSQL-specific ID fields
-                                                clean_row = {k: v for k, v in row.items() 
-                                                        if k not in ['_id', 'doc_id']}
+                                                clean_row = {}
+                                                for k, v in row.items():
+                                                    if k == 'doc_id':
+                                                        continue
+                                                    if k == '_id':
+                                                        clean_row['id'] = str(v)
+                                                    else:
+                                                        clean_row[k] = v
                                                 
                                                 if not clean_row:
                                                     continue
                                                 
                                                 # ✅ CRITICAL FIX: Serialize nested objects/arrays for SQL
+                                                import decimal, datetime as _dt
                                                 serialized_row = {}
                                                 for k, v in clean_row.items():
                                                     if v is None:
                                                         serialized_row[k] = None
                                                     elif isinstance(v, (dict, list)):
-                                                        # Convert nested structures to JSON string
-                                                        serialized_row[k] = json.dumps(v)
+                                                        try:
+                                                            serialized_row[k] = json.dumps(v, default=str)
+                                                        except Exception:
+                                                            serialized_row[k] = str(v)
+                                                    elif isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
+                                                        serialized_row[k] = v.isoformat()
+                                                    elif isinstance(v, decimal.Decimal):
+                                                        serialized_row[k] = float(v)
+                                                    elif isinstance(v, bytes):
+                                                        serialized_row[k] = v.decode('utf-8', errors='replace')
                                                     else:
                                                         serialized_row[k] = v
                                                 
@@ -8052,6 +8625,25 @@ def create_app(initial_db_type, handler_name=None):
                                                         logger.warning(f"⚠️ Failed to import procedure {proc.get('name')}: {proc_err}")
                                                     
                                             conn.commit()
+                                    
+                                    # Import views (after all tables exist)
+                                    actual_handler_v = handler.handler if hasattr(handler, 'handler') else handler
+                                    if hasattr(actual_handler_v, 'create_view'):
+                                        for view in import_data.get('views', []):
+                                            try:
+                                                vname = view.get('name', '')
+                                                vdef = view.get('definition', '') or ''
+                                                if not vname or not vdef:
+                                                    continue
+                                                is_full = view.get('is_full_statement', False)
+                                                if is_full:
+                                                    m = re.search(r'\bAS\b\s+([\s\S]+)', vdef, re.IGNORECASE)
+                                                    if m:
+                                                        vdef = m.group(1).strip()
+                                                actual_handler_v.create_view(vname, vdef)
+                                                logger.info(f"✅ Imported view '{vname}'")
+                                            except Exception as view_err:
+                                                logger.warning(f"⚠️ Failed to import view '{view.get('name')}': {view_err}")
                             
                                 except Exception as e:
                                     conn.execute(text("ROLLBACK"))
@@ -8271,7 +8863,14 @@ def create_app(initial_db_type, handler_name=None):
                                 # Insert data
                                 quoted_table = actual_handler._quote_identifier(table_name.lower()) if hasattr(actual_handler, '_quote_identifier') else f'"{table_name}"'
                                 for row in table_data.get('data', []):
-                                    clean_row = {k: v for k, v in row.items() if k not in ['_id', 'doc_id']}
+                                    clean_row = {}
+                                    for k, v in row.items():
+                                        if k == 'doc_id':
+                                            continue
+                                        if k == '_id':
+                                            clean_row['id'] = str(v)
+                                        else:
+                                            clean_row[k] = v
                                     if not clean_row:
                                         continue
                                     serialized_row = {}
@@ -8300,7 +8899,7 @@ def create_app(initial_db_type, handler_name=None):
                         handler.create_collection(table_name)
                         for doc in table_data.get('data', []):
                             clean_doc = {k: v for k, v in doc.items() if k not in ['_id', 'doc_id']}
-                            handler.insert(table_name, clean_doc)
+                            handler.insert(table_name, _serialize_for_nosql(clean_doc))
                         
                         # ✅ Apply validation rules AFTER data import
                         check_constraints = table_data.get('constraints', {}).get('check', [])

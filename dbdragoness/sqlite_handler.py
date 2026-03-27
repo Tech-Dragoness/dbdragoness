@@ -124,7 +124,7 @@ with engine.connect() as conn:
             return [row[0] for row in result]
 
     def get_supported_types(self):
-        return ['INTEGER', 'TEXT', 'REAL', 'BLOB', 'NUMERIC']
+        return ['INTEGER', 'TEXT', 'REAL', 'BLOB', 'NUMERIC', 'DATE']
     
     def supports_non_pk_autoincrement(self):
         """Return True if database supports autoincrement on non-PK columns"""
@@ -217,8 +217,14 @@ with engine.connect() as conn:
                 elif 'BLOB' in col_type:
                     # BLOB stays BLOB
                     mapped_type = 'BLOB'
-                elif 'NUMERIC' in col_type or 'DECIMAL' in col_type or 'BOOLEAN' in col_type or 'DATE' in col_type or 'TIME' in col_type:
-                    # NUMERIC, DECIMAL, BOOLEAN, DATE, DATETIME -> NUMERIC
+                elif 'DATETIME' in col_type or 'TIMESTAMP' in col_type:
+                    mapped_type = 'DATETIME'
+                elif 'DATE' in col_type:
+                    mapped_type = 'DATE'
+                elif 'TIME' in col_type:
+                    mapped_type = 'TIME'
+                elif 'NUMERIC' in col_type or 'DECIMAL' in col_type or 'BOOLEAN' in col_type:
+                    # NUMERIC, DECIMAL, BOOLEAN -> NUMERIC
                     mapped_type = 'NUMERIC'
                 else:
                     # Unknown type -> TEXT (SQLite's default)
@@ -330,9 +336,9 @@ with engine.connect() as conn:
     def execute_query(self, query):
         if not self.engine:
             raise Exception("No database selected")
-    
-        statements = [s.strip() for s in query.split(';') if s.strip()]
-    
+
+        statements = self._split_sql_statements(query)
+
         if len(statements) == 1:
             with self.engine.connect() as conn:
                 result = conn.execute(text(statements[0]))
@@ -352,6 +358,52 @@ with engine.connect() as conn:
                         results.append({"rows_affected": result.rowcount})
                 conn.commit()
             return results
+
+    def _split_sql_statements(self, query):
+        """
+        Split SQL into statements on semicolons, but ignore semicolons that
+        appear inside a BEGIN...END block (e.g. trigger bodies).
+        """
+        statements = []
+        current = []
+        depth = 0  # nesting level of BEGIN...END blocks
+
+        # Tokenise by semicolons and BEGIN/END keywords
+        token_re = re.compile(
+            r'(BEGIN|END)\b'          # BEGIN or END keyword
+            r'|;'                     # statement terminator
+            r"|'(?:''|[^'])*'"        # single-quoted string (skip its contents)
+            r'|--[^\n]*'              # single-line comment
+            r'|/\*.*?\*/',            # block comment
+            re.IGNORECASE | re.DOTALL
+        )
+
+        pos = 0
+        for m in token_re.finditer(query):
+            current.append(query[pos:m.end()])
+            pos = m.end()
+            token = m.group(0).upper()
+
+            if token == 'BEGIN':
+                depth += 1
+            elif token == 'END':
+                if depth > 0:
+                    depth -= 1
+            elif token == ';':
+                if depth == 0:
+                    stmt = ''.join(current).rstrip(';').strip()
+                    if stmt:
+                        statements.append(stmt)
+                    current = []
+
+        # anything left after the last semicolon (or no semicolon at all)
+        tail = query[pos:].strip()
+        if current or tail:
+            stmt = (''.join(current) + tail).strip()
+            if stmt:
+                statements.append(stmt)
+
+        return [s for s in statements if s]
         
     def create_default_table(self, table_name):
         """Create default table with quoted name"""
@@ -444,29 +496,44 @@ with engine.connect() as conn:
                 quoted_new_columns = []
                 new_column_info = {}
 
+                composite_pk_cols = []  # Track columns in a table-level PK clause
+
                 for col_def in new_columns:
+                    # ── Handle table-level PRIMARY KEY (...) constraint ──
+                    stripped = col_def.strip()
+                    if re.match(r'^PRIMARY\s+KEY\s*\(', stripped, re.IGNORECASE):
+                        quoted_new_columns.append(stripped)
+                        pk_match = re.search(r'PRIMARY\s+KEY\s*\(([^)]+)\)', stripped, re.IGNORECASE)
+                        if pk_match:
+                            composite_pk_cols = [c.strip().strip('"') for c in pk_match.group(1).split(',')]
+                        self.logger.info(f"Detected table-level PRIMARY KEY clause: {stripped}")
+                        continue
+
                     parts = col_def.split(maxsplit=1)
                     if len(parts) >= 2:
                         col_name = parts[0]
                         rest = parts[1]
+                        col_is_in_composite_pk = col_name in composite_pk_cols
                         quoted_col_def = f'{self._quote_identifier(col_name)} {rest}'
                         quoted_new_columns.append(quoted_col_def)
-        
+
                         new_column_info[col_name] = {
                             'definition': rest,
-                            'not_null': 'NOT NULL' in rest.upper(),
-                            'pk': 'PRIMARY KEY' in rest.upper(),
+                            'not_null': 'NOT NULL' in rest.upper() or col_is_in_composite_pk,
+                            'pk': 'PRIMARY KEY' in rest.upper() or col_is_in_composite_pk,
                             'unique': 'UNIQUE' in rest.upper(),
-                            'autoincrement': 'AUTOINCREMENT' in rest.upper()  
+                            'autoincrement': 'AUTOINCREMENT' in rest.upper()
                         }
                     else:
                         quoted_new_columns.append(self._quote_identifier(col_def))
                         new_column_info[col_def] = {
                             'definition': '',
                             'not_null': False,
-                            'pk': False
+                            'pk': False,
+                            'unique': False,
+                            'autoincrement': False
                         }
-                
+
                 col_def = ', '.join(quoted_new_columns)
                 quoted_temp = self._quote_identifier(temp_table_name)
                 conn.execute(text(f"CREATE TABLE {quoted_temp} ({col_def})"))
@@ -544,43 +611,61 @@ with engine.connect() as conn:
     
     def convert_trigger_syntax(self, trigger_body, trigger_event, table_name):
         """
-        Convert trigger syntax from other databases to SQLite.
-        
-        Conversions:
-        - MySQL: SET NEW.column = value → UPDATE OF column SET NEW.column = value
-        - PostgreSQL: NEW.column := value → UPDATE OF column SET NEW.column = value
-        - Remove BEGIN...END wrappers (SQLite adds them automatically)
+        Convert trigger body from MySQL or PostgreSQL into valid SQLite trigger SQL.
+
+        Rules:
+        - Strip any leftover BEGIN...END wrappers (caller wraps in BEGIN...END).
+        - Strip PostgreSQL RETURN NEW / RETURN OLD (not valid in SQLite).
+        - Convert bare PostgreSQL assignment  NEW.col := expr
+          and MySQL bare assignment           SET NEW.col = expr
+          into a SQLite UPDATE statement:     UPDATE table SET col = expr WHERE rowid = NEW.rowid;
+        - Leave complete SQL statements (UPDATE/INSERT/DELETE/SELECT/RAISE) untouched —
+          they are valid SQLite trigger body SQL as-is.
         """
         import re
-        
-        # Remove existing BEGIN...END wrappers
-        trigger_body = re.sub(r'^\s*BEGIN\s+', '', trigger_body, flags=re.IGNORECASE)
-        trigger_body = re.sub(r'\s*END\s*;?\s*$', '', trigger_body, flags=re.IGNORECASE)
-        
-        # Convert PostgreSQL assignment (NEW.col := val) to SQLite UPDATE
-        trigger_body = re.sub(
-            r'(NEW\.\w+)\s*:=\s*',
-            r'UPDATE OF ... SET \1 = ',
-            trigger_body,
-            flags=re.IGNORECASE
-        )
-        
-        # Convert MySQL SET (SET NEW.col = val) to SQLite UPDATE
-        trigger_body = re.sub(
-            r'\bSET\s+(NEW\.\w+)\s*=\s*',
-            r'UPDATE OF ... SET \1 = ',
-            trigger_body,
-            flags=re.IGNORECASE
-        )
-        
-        # Extract the actual assignment for SQLite
-        # Pattern: UPDATE OF ... SET NEW.column = expression
-        match = re.search(r'SET\s+(NEW\.\w+)\s*=\s*(.+?)(?:;|$)', trigger_body, re.IGNORECASE)
-        if match:
-            assignment = f"{match.group(1)} = {match.group(2).strip().rstrip(';')}"
-            trigger_body = assignment
-        
-        return trigger_body.strip()
+
+        # Strip any leftover BEGIN...END wrappers
+        trigger_body = re.sub(r'^\s*BEGIN\b', '', trigger_body, flags=re.IGNORECASE)
+        trigger_body = re.sub(r'\bEND\s*;?\s*$', '', trigger_body, flags=re.IGNORECASE)
+
+        # Strip PostgreSQL RETURN NEW / RETURN OLD / RETURN NULL statements
+        trigger_body = re.sub(r'\bRETURN\s+(?:NEW|OLD|NULL)\s*;?', '', trigger_body, flags=re.IGNORECASE)
+
+        trigger_body = trigger_body.strip()
+
+        quoted_table = self._quote_identifier(table_name)
+
+        # Collect output statements (there may be multiple separated by semicolons)
+        output_statements = []
+        for raw_stmt in re.split(r';', trigger_body):
+            stmt = raw_stmt.strip()
+            if not stmt:
+                continue
+
+            # PostgreSQL bare assignment: NEW.col := expr
+            pg_assign = re.match(r'^NEW\.(\w+)\s*:=\s*(.+)$', stmt, re.IGNORECASE)
+            if pg_assign:
+                col = pg_assign.group(1)
+                expr = pg_assign.group(2).strip().rstrip(';')
+                output_statements.append(
+                    f"UPDATE {quoted_table} SET {col} = {expr} WHERE rowid = NEW.rowid"
+                )
+                continue
+
+            # MySQL bare assignment: SET NEW.col = expr  (no table prefix — pure assignment)
+            mysql_assign = re.match(r'^SET\s+NEW\.(\w+)\s*=\s*(.+)$', stmt, re.IGNORECASE)
+            if mysql_assign:
+                col = mysql_assign.group(1)
+                expr = mysql_assign.group(2).strip().rstrip(';')
+                output_statements.append(
+                    f"UPDATE {quoted_table} SET {col} = {expr} WHERE rowid = NEW.rowid"
+                )
+                continue
+
+            # Complete SQL statement — leave untouched (works natively in SQLite triggers)
+            output_statements.append(stmt)
+
+        return ';\n    '.join(output_statements) + ';' if output_statements else trigger_body
 
     def supports_plsql(self):
         return False
@@ -726,6 +811,9 @@ with engine.connect() as conn:
                 trigger_body = f"UPDATE {quoted_table} SET {column} = {value_expr} WHERE rowid = NEW.rowid;"
                 logger.debug(f"[TRIGGER IN TRANSACTION] Transformed to UPDATE: {trigger_body}")
         
+        # Drop any existing trigger with this name before recreating
+        conn.execute(text(f"DROP TRIGGER IF EXISTS {quoted_trigger}"))
+
         # Build complete trigger SQL
         trigger_sql = f"""CREATE TRIGGER {quoted_trigger}
             {timing.upper()} {event.upper()} ON {quoted_table}
@@ -733,9 +821,9 @@ with engine.connect() as conn:
         BEGIN
             {trigger_body}
         END;"""
-        
+
         logger.debug(f"[TRIGGER IN TRANSACTION] Final spell:\n{trigger_sql}")
-        
+
         # Execute within provided transaction - NO COMMIT
         conn.execute(text(trigger_sql))
         
@@ -818,10 +906,14 @@ with engine.connect() as conn:
                 elif 'DELETE' in trigger_sql.upper():
                     event = 'DELETE'
             
+                # Extract just the body between BEGIN...END for portability
+                body_match = re.search(r'\bBEGIN\b(.+?)(?:\bEND\b)', trigger_sql, re.DOTALL | re.IGNORECASE)
+                trigger_body = body_match.group(1).strip() if body_match else trigger_sql
+
                 triggers.append({
-                    'name': r[0], 
-                    'table': r[1], 
-                    'sql': trigger_sql,
+                    'name': r[0],
+                    'table': r[1],
+                    'sql': trigger_body,
                     'timing': timing,
                     'event': event
                 })
@@ -905,12 +997,16 @@ with engine.connect() as conn:
         }
         return table_name.lower() in SYSTEM_TABLES
 
-    # And in sqlite_handler.py, replace build_column_definitions method:
-
     def build_column_definitions(self, schema, quote=True):
-        """Build column definition strings for table creation"""
+        """Build column definition strings for table creation.
+
+        Supports composite primary keys: when more than one column has pk=True,
+        inline PRIMARY KEY constraints are omitted and a table-level
+        PRIMARY KEY (...) clause is appended instead.
+        Note: SQLite does NOT support AUTOINCREMENT on composite PK columns.
+        """
         columns_def = []
-        
+
         # SQLite reserved keywords that should be quoted
         RESERVED_KEYWORDS = {
             'table', 'select', 'from', 'where', 'insert', 'update', 'delete',
@@ -918,56 +1014,86 @@ with engine.connect() as conn:
             'group', 'having', 'limit', 'offset', 'join', 'on', 'as', 'in',
             'exists', 'case', 'when', 'then', 'else', 'end', 'union', 'all'
         }
-        
+
+        # Detect composite PK up front
+        pk_columns = [col for col in schema if col.get('pk')]
+        has_composite_pk = len(pk_columns) > 1
+
         for col in schema:
             col_name_raw = col['name']
             col_type = col['type']
-            
+
             # Always quote reserved keywords
             if quote or col_name_raw.lower() in RESERVED_KEYWORDS:
                 col_name = self._quote_identifier(col_name_raw)
             else:
                 col_name = col_name_raw
-            
+
             # Ensure type is provided
             if not col_type:
                 col_type = 'TEXT'
-            
+
             col_def = f"{col_name} {col_type}"
-            
+
             if col.get('pk'):
-                col_def += " PRIMARY KEY"
-                if col.get('autoincrement'):
-                    col_def += " AUTOINCREMENT"
+                if not has_composite_pk:
+                    # Single PK — inline (AUTOINCREMENT only valid here)
+                    col_def += " PRIMARY KEY"
+                    if col.get('autoincrement'):
+                        col_def += " AUTOINCREMENT"
+                else:
+                    # Composite PK member — only NOT NULL inline;
+                    # table-level PRIMARY KEY clause appended below
+                    col_def += " NOT NULL"
             else:
                 if col.get('notnull'):
                     col_def += " NOT NULL"
                 if col.get('unique'):
                     col_def += " UNIQUE"
-            
+
             # ✅ ADD CHECK CONSTRAINT
             if col.get('check_constraint'):
                 col_def += f" CHECK ({col['check_constraint']})"
-            
+
             columns_def.append(col_def)
-        
+
+        # Append composite PRIMARY KEY table-level constraint
+        if has_composite_pk:
+            pk_col_names = [
+                self._quote_identifier(col['name']) if (quote or col['name'].lower() in RESERVED_KEYWORDS)
+                else col['name']
+                for col in pk_columns
+            ]
+            columns_def.append(f"PRIMARY KEY ({', '.join(pk_col_names)})")
+            self.logger.debug(f"Added composite PK clause: PRIMARY KEY ({', '.join(pk_col_names)})")
+
         return columns_def
     
     def build_column_definition_for_create(self, quoted_name, type_with_length, is_pk, is_not_null, is_autoincrement, is_unique, table_name=None, has_composite_pk=False):
-        """Build column definition for CREATE TABLE"""
+        """Build column definition for CREATE TABLE.
+
+        When has_composite_pk=True the caller is responsible for appending a
+        table-level PRIMARY KEY (...) clause; this method omits the inline
+        PRIMARY KEY keyword for the affected columns.
+        Note: SQLite does NOT support AUTOINCREMENT on composite PK columns.
+        """
         col_def = f"{quoted_name} {type_with_length}"
-        
-        if is_pk:
+
+        if is_pk and not has_composite_pk:
+            # Single PK — inline
             if is_autoincrement:
                 col_def += " PRIMARY KEY AUTOINCREMENT"
             else:
                 col_def += " PRIMARY KEY"
+        elif is_pk and has_composite_pk:
+            # Composite PK member — only NOT NULL inline
+            col_def += " NOT NULL"
         else:
             if is_not_null:
                 col_def += " NOT NULL"
             if is_unique:
                 col_def += " UNIQUE"
-        
+
         return col_def
     
     def reset_sequence_after_copy(self, table_name, column_name):
@@ -1010,12 +1136,12 @@ with engine.connect() as conn:
         """Copy table structure, data, and triggers"""
         schema = self.get_table_schema(source_table)
         data_rows = self.read(source_table)
-        
-        # Build CREATE TABLE
-        columns_def = self.build_column_definitions(schema, quote=False)
+
+        # build_column_definitions already handles composite PK correctly
+        columns_def = self.build_column_definitions(schema, quote=True)
         col_def_str = ', '.join(columns_def)
         quoted_dest = self._quote_identifier(dest_table)
-        
+
         with self.engine.connect() as conn:
             create_sql = f"CREATE TABLE {quoted_dest} ({col_def_str})"
             conn.execute(text(create_sql))
