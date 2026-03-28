@@ -42,7 +42,7 @@ if not os.path.exists(db_path):
 else:
     print(f"✅ Found database: {{db_path}}")
     db = TinyDB(db_path)
-    tables = db.tables()
+    tables = list(db.tables())
     print(f"Tables: {{tables}}")
 
     if tables:
