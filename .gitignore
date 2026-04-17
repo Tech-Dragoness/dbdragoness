@@ -39,10 +39,6 @@ env/
 *.swo
 *~
 
-# Frontend
-node_modules/
-dbdragoness/frontend/
-
 # OS
 .DS_Store
 Thumbs.db
