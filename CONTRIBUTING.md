@@ -6,48 +6,48 @@ First off, thank you for considering contributing to dbdragoness! This is a begi
 
 I am looking for help with the following specific goals, though any beneficial addition or suggestion is welcome:
 
-1. Achieving Database Agnosticism
+### 1. Achieving Database Agnosticism
 
 I want to move toward a truly decoupled architecture.
 
-### The Goal: 
+#### The Goal: 
 Remove specific database names (e.g., "MySQL", "MongoDB", "PostgreSQL") from all files except for that specific database's own handler file.
 
-### The Constraint: 
+#### The Constraint: 
 This must be done without breaking the existing conversion or connection logic.
 
-2. Fixing Conversion Logic
+### 2. Fixing Conversion Logic
 
 The automated conversion between SQL and NoSQL databases sometimes fails.
 
-### The Issue: 
+#### The Issue: 
 Errors occur during certain conversions, particularly when handling complex metadata (like triggers or specific constraints), though the exact triggers for these failures are still being identified.
 
-### The Task: 
+#### The Task: 
 Help me identify these edge cases and make the conversion engine more robust.
 
-3. Global Undo-Redo
+### 3. Global Undo-Redo
 
 I need a more forgiving user experience.
 
-### The Task: 
+#### The Task: 
 Implement a global Undo/Redo system that allows users to revert or re-apply actions across the application.
 
-4. Local AI Assistant (No APIs)
+### 4. Local AI Assistant (No APIs)
 
 I want a "Natural Language to Code" feature that respects user privacy and offline usage.
 
-### The Constraint: 
+#### The Constraint: 
 This must be a basic, local-only AI assistant. It should not depend on external APIs (like OpenAI or Anthropic).
 
-### The Goal: 
+#### The Goal: 
 Convert human language queries into the specific code/query language of the currently active database.
 
-5. Customization & Themes
+### 5. Customization & Themes
 
 Help me make the GUI more personal.
 
-### The Task: 
+#### The Task: 
 Add a system for different theme templates so users can choose a visual style that fits their workflow.
 
 ## How to Get Involved
