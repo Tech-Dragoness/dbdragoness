@@ -8,6 +8,18 @@
   A lightweight GUI manager for SQL & NoSQL databases
 </p>
 
+## ✨ Interface Preview
+
+<p align="center">
+  <img src="assets/Home_Page.png" width="48%">
+  <img src="assets/Table_Page.png" width="48%">
+</p>
+
+<p align="center">
+  <img src="assets/Structure_Tab.png" width="48%">
+  <img src="assets/Documents_Page.png" width="48%">
+</p>
+
 ## Features
 
 - 🎯 Support for multiple databases: SQLite, MySQL, PostgreSQL, DuckDB, TinyDB, MongoDB
