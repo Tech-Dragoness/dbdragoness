@@ -16,8 +16,13 @@
 </p>
 
 <p align="center">
-  <img src="assets/Structure_Tab.png" width="48%">
-  <img src="assets/Documents_Page.png" width="48%">
+  <img src="assets/Conversion_Popup.png" width="48%">
+  <img src="assets/Diagram_Generator.png" width="48%">
+</p>
+
+<p align="center">
+  <img src="assets/Chart_Creator.png" width="48%">
+  <img src="assets/Aggregation_Tab.png" width="48%">
 </p>
 
 ## Features
